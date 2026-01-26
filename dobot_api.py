@@ -145,7 +145,9 @@ class DobotApi:
     def send_data(self, string):
        # self.log(f"Send to {self.ip}:{self.port}: {string}")
         try:
+            print(f"Send to {self.ip}:{self.port}: {string}")
             self.socket_dobot.send(str.encode(string, 'utf-8'))
+            print(f"Send to {self.ip}:{self.port}: {string} success")
         except Exception as e:
             print(e)
             while True:
@@ -160,10 +162,13 @@ class DobotApi:
         """
         Read the return value
         """
+        print(f"[DEBUG]   wait_reply() 대기 중...")
         data = ""
         try:
             data = self.socket_dobot.recv(1024)
+            print(f"[DEBUG]   recv() 수신 완료: {len(data)} bytes")
         except Exception as e:
+            print(f"[DEBUG] ✗ recv() 에러: {e}")
             print(e)
             self.socket_dobot = self.reConnect(self.ip, self.port)
 
@@ -190,9 +195,12 @@ class DobotApi:
         """
         send-recv Sync
         """
+        print(f"\n[DEBUG] ▶ sendRecvMsg() 호출됨")
+        print(f"[DEBUG]   명령: {string}")
         with self.__globalLock:
             self.send_data(string)
             recvData = self.wait_reply()
+            print(f"[DEBUG] ◀ 응답 수신: {recvData}")
             return recvData
 
     def __del__(self):

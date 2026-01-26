@@ -350,16 +350,25 @@ class RobotUI(object):
         self.client_dash.SpeedFactor(int(self.entry_speed.get()))
 
     def movj(self):
+        # coordinateMode=0: 직교좌표계 (X,Y,Z,Rx,Ry,Rz)
+        # 속도 20, 가속도 50 추가
         self.client_dash.MovJ(float(self.entry_dict["X:"].get()), float(self.entry_dict["Y:"].get()), float(self.entry_dict["Z:"].get()),
-                              float(self.entry_dict["Rx:"].get()), float(self.entry_dict["Ry:"].get()), float(self.entry_dict["Rz:"].get()),0)
+                              float(self.entry_dict["Rx:"].get()), float(self.entry_dict["Ry:"].get()), float(self.entry_dict["Rz:"].get()),
+                              SpeedL=20, AccL=50, User=0, Tool=0, coordinateMode=0)
 
     def movl(self):
+        # coordinateMode=0: 직교좌표계 (X,Y,Z,Rx,Ry,Rz)
+        # 속도 20, 가속도 50 추가
         self.client_dash.MovL(float(self.entry_dict["X:"].get()), float(self.entry_dict["Y:"].get()), float(self.entry_dict["Z:"].get()),
-                              float(self.entry_dict["Rx:"].get()), float(self.entry_dict["Ry:"].get()), float(self.entry_dict["Rz:"].get()),0)
+                              float(self.entry_dict["Rx:"].get()), float(self.entry_dict["Ry:"].get()), float(self.entry_dict["Rz:"].get()),
+                              SpeedL=20, AccL=50, User=0, Tool=0, coordinateMode=0)
 
     def joint_movj(self):
+        # coordinateMode=1: 관절 각도 (J1~J6)
+        # 속도 20, 가속도 50 추가
         self.client_dash.MovJ(float(self.entry_dict["J1:"].get()), float(self.entry_dict["J2:"].get()), float(self.entry_dict["J3:"].get()),
-                                   float(self.entry_dict["J4:"].get()), float(self.entry_dict["J5:"].get()), float(self.entry_dict["J6:"].get()),1)
+                              float(self.entry_dict["J4:"].get()), float(self.entry_dict["J5:"].get()), float(self.entry_dict["J6:"].get()),
+                              SpeedJ=20, AccJ=50, User=0, Tool=0, coordinateMode=1)
 
     def confirm_do(self):
         if self.combo_status.get() == "On":

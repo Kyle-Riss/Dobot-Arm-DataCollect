@@ -1,0 +1,26 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Legacy archive (보관용, git 미포함)
+legacy_archive/
+
+# Data output folders (수집 데이터, 내용 git 미포함)
+vla_dataset/*
+!vla_dataset/.gitkeep
+vla_dataset_define/*
+!vla_dataset_define/.gitkeep
+vla_dataset_random_pose/*
+!vla_dataset_random_pose/.gitkeep
+
+# Logs (내용 git 미포함, 폴더만 유지)
+logs/*
+!logs/.gitkeep
+
+# Calibration outputs
+*.npz
+
+# OS
+.DS_Store
+Thumbs.db

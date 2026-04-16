@@ -1,195 +1,232 @@
-# TCP-IP-Python-V4 项目说明文档
+# Dobot-Arm-DataCollect
 
-## 项目概述
-
-本项目是越疆机器人TCP-IP-CR-Python-V4二次开发API程序，用于通过TCP/IP协议控制越疆机器人。项目提供了完整的机器人控制接口，包括运动控制、状态监控、报警处理等功能。
-
-## 环境要求
-
-### Python版本
-
-- Python 3.6 或更高版本
-
-### 必需安装的库
-
-```bash
-# 基础数值计算库
-pip install numpy
-
-# JSON数据处理（Python内置，无需安装）
-# import json
-
-# 网络通信（Python内置，无需安装）
-# import socket
-
-# 多线程支持（Python内置，无需安装）
-# import threading
-
-# 时间处理（Python内置，无需安装）
-# import time
-
-# 正则表达式（Python内置，无需安装）
-# import re
-
-# GUI界面库（如果使用ui.py）
-pip install tkinter  # 通常Python自带
-```
-
-### 网络配置要求
-
-- 本机IP地址需设置为192.168.X.X网段
-- 机器人需切换至TCP/IP模式
-- 确保29999和30004端口未被占用
-
-## 主要程序文件及功能
-
-### 1. main.py
-
-**功能**: 项目主入口文件
-
-- 演示基本的机器人连接和控制流程
-- 包含完整的机器人操作示例
-- 适合初学者了解项目结构
-
-### 2. dobot_api.py
-
-**功能**: 核心API接口文件
-
-- **DobotApi**: 基础通信类，处理TCP连接
-- **DobotApiDashboard**: 机器人控制接口类
-  - 机器人使能/下使能
-  - 运动控制指令（MovJ, MovL, Arc等）
-  - 状态查询和设置
-  - 报警信息获取（包含新增的GetError接口）
-- **DobotApiFeedBack**: 状态反馈类
-  - 实时获取机器人状态信息
-  - 监控机器人运行模式
-  - 获取当前指令ID
-- **MyType**: 数据类型定义
-- **alarm_controller**: 控制器报警处理
-- **alarm_servo**: 伺服报警处理
-
-### 3. ui.py
-
-**功能**: 图形用户界面程序
-
-- 提供可视化的机器人控制界面
-- 集成了机器人连接、运动控制、状态显示等功能
-- 支持实时显示机器人状态和报警信息
-- 优先使用GetError接口获取报警信息，失败时回退到原有方式
-
-### 4. 测试和示例文件
-
-#### get_error_example.py
-
-**功能**: GetError接口使用示例
-
-- 提供RobotErrorMonitor类，用于报警监控
-- 演示如何获取和处理多语言报警信息
-- 包含报警信息保存到文件的功能
-- 注释采用中英文对照
-
-### 5. 文档文件
-
-#### GetError_README.md
-
-**功能**: GetError接口中文说明文档
-
-- 详细说明GetError接口的使用方法
-- 包含接口参数、返回值、示例代码等
-- 提供故障排除和注意事项
-
-#### GetError_README_EN.md
-
-**功能**: GetError接口英文说明文档
-
-- GetError_README.md的英文版本
-- 便于国际用户理解和使用
-
-## 项目目录结构
-
-TCP-IP-Python-V4/
-├── main.py                    # 主程序入口
-├── dobot_api.py               # 核心API接口
-├── ui.py                      # 图形界面程序
-├── PythonExample.py           # Python示例
-├── get_error_example.py       # GetError使用示例
-├── GetError_README.md         # GetError中文文档
-├── GetError_README_EN.md      # GetError英文文档
-├── README.md                  # 项目说明文档
-└── files/                     # 其他支持文件
-
-## 快速开始
-
-### 1. 环境准备
-
-```bash
-# 克隆项目
-git clone https://github.com/Dobot-Arm/TCP-IP-CR-Python-V4.git
-
-# 安装依赖
-pip install numpy
-```
-
-### 2. 网络配置
-
-- 设置本机IP为192.168.X.X网段
-- 确保机器人处于TCP/IP模式
-
-### 3. 运行程序
-
-# 运行主程序
-python main.py
-
-# 或运行图形界面
-python main_UI.py
-
-
-## 常见问题解决
-
-### 1. ModuleNotFoundError: No module named 'numpy'
-
-**解决方法**: 安装numpy库
-
-```bash
-pip install numpy
-```
-
-### 2. Connection refused, IP:Port has been occupied
-
-**解决方法**: 检查29999端口是否被占用，关闭占用该端口的程序
-
-### 3. Control Mode Is Not Tcp
-
-**解决方法**: 在DobotStudio Pro中将机器人模式切换至TCP/IP模式
-
-### 4. 机器人状态异常
-
-| 输出信息                             | 机器状态     | 解决方法                 |
-| ------------------------------------ | ------------ | ------------------------ |
-| Command execution failed             | 指令执行失败 | 检查指令参数和机器人状态 |
-| The robot is in an error state       | 机器错误状态 | 清除报警后重试           |
-| The robot is in emergency stop state | 急停状态     | 释放急停按钮             |
-| The robot is in power down state     | 下电状态     | 给机器人上电             |
-
-## 注意事项
-
-1. **安全第一**: 运行示例前请确保机器人处于安全位置，防止发生碰撞
-2. **网络配置**: 确保网络配置正确，IP地址在同一网段
-3. **端口占用**: 确保29999和30004端口未被其他程序占用
-4. **机器人模式**: 确保机器人处于TCP/IP控制模式
-5. **权限问题**: 某些操作可能需要管理员权限
-
-## 技术支持
-
-如遇到问题，请参考：项目README.md文档
-
-- GetError相关文档
-- 示例代码和测试程序
-- 越疆官方技术支持
+Dobot E6 로봇 + 듀얼 카메라(HIK + ZED)를 이용한 VLA(Vision-Language-Action) 데이터 수집 시스템.
+FastAPI 기반 웹 서버와 ROS2 Humble 동기화 레코더를 통해 로봇 상태와 카메라 프레임을 정밀하게 정합(align)하여 저장한다.
 
 ---
 
-**版本**: V4
-**更新日期**: 2025-9-5
-**维护**: dobot_futingxing
+## 시스템 구성
+
+| 구성 요소 | 사양 |
+|---|---|
+| 로봇 | Dobot E6 (TCP/IP 192.168.5.1) |
+| 손목 카메라 | HIKRobot (USB) |
+| 씬 카메라 | ZED 2i (USB3, LEFT view) |
+| 컴퓨터 | NVIDIA Jetson (Ubuntu 22.04 aarch64) |
+| 서버 | FastAPI (port 8000) |
+| 동기화 | ROS2 Humble — ApproximateTimeSynchronizer |
+
+---
+
+## 데이터 수집 파이프라인
+
+```mermaid
+flowchart TD
+    subgraph HW["Hardware"]
+        HIK["HIK Robot Camera\n손목 카메라 · USB"]
+        ZED["ZED 2i\n씬 카메라 · USB3"]
+        DOBOT["Dobot E6\nTCP/IP · 192.168.5.1"]
+    end
+
+    subgraph SERVER["robot_server.py  ·  FastAPI :8000"]
+        direction TB
+        HIK_LOOP["_hik_grab_loop\n(daemon thread)"]
+        ZED_LOOP["_zed_grab_loop\n(daemon thread)"]
+        ROBOT_PUB["_robot_pub_loop\n~50 Hz"]
+        MJPEG["MJPEG 스트림\n브라우저 실시간 뷰"]
+        API["REST API + WebSocket\n/connect /status\n/pick-place/auto\n/camera/* /ws/logs"]
+    end
+
+    subgraph ROS2["ros2_recorder.py  ·  ROS2 Humble Node"]
+        direction TB
+        P_HIK["/dobot/hik/image_raw"]
+        P_ZED["/dobot/zed/image_raw"]
+        P_JS["/dobot/joint_states"]
+        SYNC["ApproximateTimeSynchronizer\nslop = 35 ms"]
+        CACHE["Robot State Cache\njoints / tcp / gripper"]
+        SAVE_W["Save Worker\n(async queue)"]
+    end
+
+    subgraph DISK["External Drive  ·  /media/.../2CAM/"]
+        EP["Episode N/\n├─ images/hik/frame_XXXXXX.jpg  224×224\n├─ images/zed/frame_XXXXXX.jpg  224×224\n├─ robot_data.csv\n├─ dataset.npy\n└─ metadata.txt"]
+    end
+
+    HIK --> HIK_LOOP
+    ZED --> ZED_LOOP
+    DOBOT --> ROBOT_PUB
+
+    HIK_LOOP -->|"BGR"| MJPEG
+    HIK_LOOP -->|"publish + stamp"| P_HIK
+    ZED_LOOP -->|"BGR"| MJPEG
+    ZED_LOOP -->|"publish + stamp"| P_ZED
+    ROBOT_PUB -->|"publish"| P_JS
+    ROBOT_PUB -->|"update"| CACHE
+
+    P_HIK --> SYNC
+    P_ZED --> SYNC
+    SYNC -->|"35ms 이내 쌍 보장"| SAVE_W
+    CACHE -->|"sync 시각 기준"| SAVE_W
+    SAVE_W --> EP
+
+    API -->|"start/stop recording"| ROS2
+    API -->|"MJPEG"| MJPEG
+```
+
+### 동기화 원리
+
+```mermaid
+sequenceDiagram
+    participant H as HIK grab thread
+    participant Z as ZED grab thread
+    participant S as ApproximateTime<br/>Synchronizer
+    participant C as Robot State Cache
+    participant R as _robot_pub_loop (50Hz)
+    participant D as Disk
+
+    H->>S: Image + stamp_hik (캡처 직후)
+    Z->>S: Image + stamp_zed (캡처 직후)
+    R->>C: joints/tcp/gripper @ 50Hz
+
+    Note over S: |stamp_hik − stamp_zed| ≤ 35ms 일 때만 콜백 발동
+
+    S->>D: hik_frame + zed_frame + robot_state(cache 기준)
+    Note over D: 두 카메라 프레임이 동일 시각 기준으로 정합되어 저장
+```
+
+### 모드별 동작
+
+| 조건 | 레코딩 경로 | 동기화 품질 |
+|---|---|---|
+| ROS2 + HIK + ZED | `ros2_recorder` sync callback | HIK ↔ ZED 35ms 이내 보장 |
+| ROS2 + HIK only | legacy `_record_tick` fallback | 버퍼 지연 최대 50ms |
+| ROS2 미설치 | legacy `_record_tick` fallback | 버퍼 지연 최대 50ms |
+
+---
+
+## 설치
+
+### 1. 의존 패키지
+
+```bash
+pip install fastapi uvicorn numpy opencv-python
+```
+
+### 2. ROS2 Humble (Ubuntu 22.04 aarch64)
+
+```bash
+sudo apt install -y software-properties-common curl
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+     -o /usr/share/keyrings/ros-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+     http://packages.ros.org/ros2/ubuntu jammy main" \
+     | sudo tee /etc/apt/sources.list.d/ros2.list
+sudo apt update
+sudo apt install -y ros-humble-ros-base ros-humble-cv-bridge \
+                    python3-rclpy python3-sensor-msgs
+
+echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 3. 카메라 SDK
+
+- **HIKRobot**: MVS SDK 설치 후 `MvImport/` 경로 확인
+- **ZED**: [ZED SDK](https://www.stereolabs.com/developers/) + `pyzed` 설치
+
+---
+
+## 실행
+
+```bash
+cd Dobot_E6_Moveit2/src
+source /opt/ros/humble/setup.bash
+python robot_server.py
+```
+
+브라우저에서 `http://<Jetson-IP>:8000` 접속.
+
+### 서버 시작 로그 (정상)
+
+```
+[ros2_recorder] ROS2 노드 시작 완료
+[HH:MM:SS] ROS2 recorder ready (sync mode)
+[HH:MM:SS] Server ready
+```
+
+### 데이터 수집 순서
+
+1. **Connect** — 로봇 TCP/IP 연결
+2. **Enable** — 로봇 활성화
+3. **Camera Start** — HIK / ZED 카메라 시작
+4. **Auto Collect N** — N개 에피소드 자동 수집
+5. 수집 완료 로그 확인:
+   ```
+   Recording started → .../1 (ZED=ON, mode=ROS2+sync)
+   [ros2_recorder] stopped — 680 synced frames
+   Saved 680 frames → .../1
+   ```
+
+---
+
+## 저장 데이터 형식
+
+에피소드 하나당 아래 구조로 저장된다.
+
+```
+Episode N/
+├── images/
+│   ├── hik/  frame_000000.jpg ~ frame_XXXXXX.jpg   # 224×224 (손목 카메라)
+│   └── zed/  frame_000000.jpg ~ frame_XXXXXX.jpg   # 224×224 (씬 카메라)
+├── robot_data.csv    # 프레임별 타임스탬프 + 관절각 + TCP 포즈 + 그리퍼 상태
+├── dataset.npy       # robot_data.csv 와 동일 내용 (numpy array of dicts)
+└── metadata.txt      # 에피소드 요약 (날짜, 프레임 수, 카메라 구성, 성공 여부)
+```
+
+### robot_data.csv 컬럼
+
+| 컬럼 | 설명 |
+|---|---|
+| `frame_id` | 프레임 번호 (0-indexed) |
+| `timestamp` | HIK 캡처 시각 (ROS clock, float) |
+| `image_path_hik` | `hik/frame_XXXXXX.jpg` |
+| `image_path_zed` | `zed/frame_XXXXXX.jpg` |
+| `j1` ~ `j6` | 관절각 (deg) |
+| `x y z rx ry rz` | TCP 포즈 (mm / deg) |
+| `gripper_tooldo1` | 그리퍼 상태 (0/1) |
+| `robot_mode` | 로봇 모드 코드 |
+
+### 수집 후 품질 확인
+
+```python
+import numpy as np
+
+data = np.load("dataset.npy", allow_pickle=True)
+timestamps = [d['timestamp'] for d in data]
+diffs = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+print(f"평균 간격: {sum(diffs)/len(diffs)*1000:.1f} ms")  # 목표: ~50 ms (20 Hz)
+print(f"최대 간격: {max(diffs)*1000:.1f} ms")              # 이상치 확인
+```
+
+---
+
+## 브랜치 구조
+
+| 브랜치 | 설명 |
+|---|---|
+| `main` | 기본 TCP/IP 제어 스크립트 |
+| `ros2` | FastAPI 서버 + ROS2 동기화 레코더 통합 버전 |
+
+---
+
+## 주요 파일
+
+```
+Dobot_E6_Moveit2/src/
+├── robot_server.py          # FastAPI 메인 서버 (카메라·로봇·레코딩 통합)
+├── ros2_recorder.py         # ROS2 동기화 레코더 모듈
+├── dobot_e6_controller.py   # Dobot E6 TCP/IP 제어
+├── pick_place_gui_random_pose.py  # 랜덤 포즈 Pick-Place 워커
+├── camera_viewer.py         # HIKRobot 카메라 래퍼
+├── suction_gripper.py       # 흡착 그리퍼 제어
+└── ROS2_FLOWCHART.md        # 상세 시스템 플로우차트
+```

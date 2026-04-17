@@ -288,8 +288,21 @@ LEVEL2_MAX_TRIES = 1   # Level 2 최대 XY 시도 1점만 → 총 픽 시도 3�
 LEVEL2_DWELL_S = 0.25   # Level 2 각 시도 시 suction dwell (초)
 LEVEL2_Z_SEARCH_HI_LO, LEVEL2_Z_SEARCH_HI_HI = 150.0, 160.0   # 탐색 높이 mm (Z 다이브 없음, 한 번만 내려서 grip)
 
-# 20Hz 기록
-RECORD_INTERVAL_MS = 50  # 20Hz = 50ms
+# 실측 기록 레이트 (QTimer 50ms + 카메라 오버헤드 → 실제 ~15Hz)
+RECORD_INTERVAL_MS = 50
+RECORD_RATE_HZ = 15
+
+# 방향 분류 (PRIMITIVE_SEGMENTATION_SPEC §3 기준)
+_MIDDLE_DIAMOND = [(83.41, -339.22), (112.31, -378.54), (83.41, -417.86), (54.51, -378.54)]
+
+def _in_middle_diamond(x, y):
+    return point_in_polygon(x, y, _MIDDLE_DIAMOND)
+
+def _transport_direction(place_x, place_y):
+    """place 좌표 기준 transport primitive 반환."""
+    if _in_middle_diamond(place_x, place_y):
+        return "move_to_middle"
+    return "move_left" if place_x >= 85.0 else "move_right"
 VLA_DATASET_BASE = os.path.join(workspace_root, "vla_dataset")
 # 저장 전 검증: 마지막 프레임이 초기 자세(INIT)에 있어야만 저장 (초기 복귀 안 한 에피소드 제외)
 INIT_POSE_TOLERANCE_MM = 20.0   # x,y,z 허용 오차 mm
@@ -335,6 +348,7 @@ class PickPlaceStepWorker(QThread):
     step_started = pyqtSignal()  # (legacy)
     recording_begin_at_initial = pyqtSignal()  # 초기 자세 1초 유지 후 발신 → 이때 20Hz 기록 시작
     episode_vacuum_durations = pyqtSignal(float, float)  # (pick_hold, place_hold) s
+    episode_meta_ready = pyqtSignal(object)   # 에피소드 semantic 메타 dict
 
     def __init__(self, robot, gripper, pick_section="A",
                  pick_x=None, pick_y=None, pick_rx=None, pick_ry=None, pick_rz=None,
@@ -361,6 +375,8 @@ class PickPlaceStepWorker(QThread):
         # Place 위치 저장 (다음 스텝에서 사용)
         self.place_x = None
         self.place_y = None
+        self.place_section = None
+        self._events = []   # [(event_name, timestamp), ...]
 
     def request_stop(self):
         self._stop_requested = True
@@ -424,9 +440,12 @@ class PickPlaceStepWorker(QThread):
             self._log(f"초기 복귀 실패: {e}")
 
     def _fail_and_go_home(self):
-        """중간 실패 시 초기 자세로 복귀 후 한 스텝 성공으로 처리 (GUI에는 항상 성공)."""
+        """중간 실패 시 초기 자세로 복귀. stop_requested면 False 반환 → 저장 안 함."""
+        self.place_x = None
+        self.place_y = None
         self._safe_return_home()
-        self.finished.emit(True)
+        # 수동 STOP으로 중단된 경우 저장하지 않음
+        self.finished.emit(not self._stop_requested)
 
     def _dist_point_to_line(self, px, py, x1, y1, x2, y2):
         """점 (px,py)에서 선분 (x1,y1)-(x2,y2)까지의 거리 (mm)."""
@@ -500,26 +519,32 @@ class PickPlaceStepWorker(QThread):
         """
         현재 포즈에서 X- 방향으로 50mm씩 최대 RED_SEARCH_MAX_STEPS번 이동하며
         빨간 블록이 보일 때까지 탐색. X가 RED_SEARCH_X_LIMIT_MIN보다 작아지면 중단.
+
+        피드백 캐시 버그 방지: cur_x를 루프 내에서 재조회하지 않고
+        이동 후 next_x로 직접 갱신한다.
         """
         if not self.camera or not getattr(self.camera, "initialized", False):
             return
+        # 현재 위치는 루프 시작 전 한 번만 읽는다
+        pose = self.robot.get_current_pose_from_feedback()
+        if not pose or len(pose) < 2:
+            return
+        cur_x = float(pose[0])
+        cur_y = float(pose[1])
         for _ in range(int(RED_SEARCH_MAX_STEPS)):
             if self._stop_requested:
                 return
             if self._is_red_block_visible():
                 self._log("Red block visible — no further X- search needed.")
                 return
-            pose = self.robot.get_current_pose_from_feedback()
-            if not pose or len(pose) < 3:
-                return
-            cur_x, cur_y = float(pose[0]), float(pose[1])
             if cur_x <= RED_SEARCH_X_LIMIT_MIN:
                 self._log(f"X limit reached (X={cur_x:.1f} <= {RED_SEARCH_X_LIMIT_MIN}) — stop X- search.")
                 return
             next_x = max(RED_SEARCH_X_LIMIT_MIN, cur_x + RED_SEARCH_X_STEP)
             self._log(f"Red block not visible → moving X- search step to X={next_x:.1f}mm")
-            if not self._move(next_x, cur_y, current_z, velocity=18.0, rx=rx, ry=ry, rz=rz):
+            if not self._move(next_x, cur_y, current_z, velocity=60.0, rx=rx, ry=ry, rz=rz):
                 return
+            cur_x = next_x  # 이동 완료 후 로컬 변수로 갱신 (피드백 재조회 없음)
 
     def _sample_waypoint_avoiding_line(self, from_x, from_y, to_x, to_y, z_min=None, z_max=None, min_dist=None):
         """직선 경로에서 최소 min_dist 이상 떨어진 waypoint 샘플. 마지막에 ±WAYPOINT_NOISE_MM 노이즈."""
@@ -635,8 +660,10 @@ class PickPlaceStepWorker(QThread):
             # Place 위치 저장 (다음 스텝에서 사용)
             self.place_x = place_x
             self.place_y = place_y
+            self.place_section = place_section
             self.episode_pick_x = pick_x
             self.episode_pick_y = pick_y
+            self._events = []
 
             # 1) 초기 위치
             self._log("1) Initial position...")
@@ -704,6 +731,7 @@ class PickPlaceStepWorker(QThread):
 
             pick_hold = random.uniform(PICK_HOLD_TIME_LO, PICK_HOLD_TIME_HI)
             self._log(f"3) Gripper ON at Pick (Z=101), holding {pick_hold:.2f}s...")
+            self._events.append(("gripper_on", time.time()))
             self.gripper.grip(wait_time=pick_hold)
             time.sleep(0.3)  # 추가 유지 시간
             if self._stop_requested:
@@ -756,12 +784,19 @@ class PickPlaceStepWorker(QThread):
                 return
 
             # 101.7 도달할 때까지 그리퍼 OFF 하지 않음 — 도달 확인 후에만 해제
-            if not self._wait_until_z_reached(RELEASE_Z, tolerance_mm=RELEASE_Z_TOLERANCE_MM):
-                self._log("Place: Z=101 도달 확인 실패 → 그리퍼 해제 후 복귀")
-                if self.gripper:
-                    self.gripper.release(wait_time=0.2)
-                self._fail_and_go_home()
-                return
+            # 피드백 갱신 대기 후 좁은 허용치로 1차 확인, 실패 시 ±8mm 넓은 허용치로 재확인
+            time.sleep(0.2)
+            if not self._wait_until_z_reached(RELEASE_Z, tolerance_mm=RELEASE_Z_TOLERANCE_MM, timeout_s=8.0):
+                pose_now = self.robot.get_current_pose_from_feedback()
+                z_now = float(pose_now[2]) if pose_now and len(pose_now) >= 3 else None
+                if z_now is not None and abs(z_now - RELEASE_Z) <= 8.0:
+                    self._log(f"Place Z: 1차 확인 실패, 현재 Z={z_now:.2f}mm (±8mm 이내) → 진행")
+                else:
+                    self._log(f"Place: Z=101 도달 확인 실패 (Z={z_now}) → 그리퍼 해제 후 복귀")
+                    if self.gripper:
+                        self.gripper.release(wait_time=0.2)
+                    self._fail_and_go_home()
+                    return
             if self._stop_requested:
                 self._fail_and_go_home()
                 return
@@ -778,6 +813,7 @@ class PickPlaceStepWorker(QThread):
 
             place_hold = random.uniform(PLACE_HOLD_TIME_LO, PLACE_HOLD_TIME_HI)
             self._log(f"6.2) Gripper OFF at Place (Z=101), holding {place_hold:.2f}s...")
+            self._events.append(("gripper_off", time.time()))
             if self.gripper:
                 self.gripper.release(wait_time=place_hold)
             if self._stop_requested:
@@ -816,7 +852,19 @@ class PickPlaceStepWorker(QThread):
 
             self._log(f"Step complete ({self.pick_section} section Pick → {place_section} section Place).")
             self.episode_vacuum_durations.emit(pick_hold, place_hold)
-            # Place 위치를 반환 (다음 스텝에서 사용)
+            self.episode_meta_ready.emit({
+                "task_name": "pick_and_place",
+                "object_label": "red_block",
+                "pick_section": self.pick_section,
+                "pick_x": round(pick_x, 3),
+                "pick_y": round(pick_y, 3),
+                "place_section": place_section,
+                "place_x": round(place_x, 3),
+                "place_y": round(place_y, 3),
+                "transport_direction": _transport_direction(place_x, place_y),
+                "success": True,
+                "events": list(self._events),
+            })
             self.finished.emit(True)
         except Exception as e:
             self._log(f"Error: {e}")
@@ -845,16 +893,19 @@ class PickPlaceGUINew(QMainWindow):
         self.auto_collect_done = 0
         # Stop(중단) 버튼으로 에피소드 중단 시: 진행 중이던 "현재 폴더"는 저장하지 않기 위한 플래그
         self.abort_current_episode = False
+        # STOP 후 재시도를 위한 일시정지 상태 (카운트·위치 유지)
+        self._auto_paused = False
         # 위치 기억: 마지막으로 Place한 위치 (다음 스텝의 Pick 위치)
         self.last_place_x = None
         self.last_place_y = None
         self.current_pick_section = "A"  # 현재 Pick할 섹션 ("A" or "B")
-        # 20Hz 기록
+        # 기록
         self.vla_dataset_base = VLA_DATASET_BASE
         self.recorded_data = []
         self.recording = False
         self.record_save_dir = None
         self.record_frame_count = 0
+        self._pending_episode_meta = {}
         self.record_timer = QTimer(self)
         self.record_timer.timeout.connect(self._on_record_tick)
         # Vacuum 명령 기반 로그 (명령 ON 유지 시간, s)
@@ -1040,6 +1091,11 @@ class PickPlaceGUINew(QMainWindow):
         self.stop_auto_btn.clicked.connect(self.stop_auto_collect)
         self.stop_auto_btn.setEnabled(False)
         row2.addWidget(self.stop_auto_btn)
+        self.resume_auto_btn = QPushButton("Resume (같은위치 재시도)")
+        self.resume_auto_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.resume_auto_btn.clicked.connect(self.resume_auto_collect)
+        self.resume_auto_btn.setVisible(False)
+        row2.addWidget(self.resume_auto_btn)
         layout.addLayout(row2)
         # 자동 수집 시 한 에피소드 성공 후 [다음] 버튼으로 다음 스텝 진행
         row_result = QHBoxLayout()
@@ -1196,6 +1252,7 @@ class PickPlaceGUINew(QMainWindow):
         self.step_worker.log_signal.connect(self.log)
         self.step_worker.finished.connect(self.on_pick_place_step_finished)
         self.step_worker.episode_vacuum_durations.connect(self._on_episode_vacuum_durations)
+        self.step_worker.episode_meta_ready.connect(self._on_episode_meta_ready)
         if do_record:
             self.step_worker.recording_begin_at_initial.connect(self._start_20hz_recording)
         self.step_worker.start()
@@ -1227,17 +1284,36 @@ class PickPlaceGUINew(QMainWindow):
         self.step_worker.log_signal.connect(self.log)
         self.step_worker.finished.connect(self.on_pick_place_step_finished)
         self.step_worker.episode_vacuum_durations.connect(self._on_episode_vacuum_durations)
+        self.step_worker.episode_meta_ready.connect(self._on_episode_meta_ready)
         self.step_worker.recording_begin_at_initial.connect(self._start_20hz_recording)
         self.step_worker.start()
 
     def stop_auto_collect(self):
-        """자동 수집 중단"""
-        # 중단 시: 현재 진행 중인 에피소드는 저장하지 않음
+        """자동 수집 일시 중단 (현재 에피소드 저장 안 함, 카운트·위치 유지).
+        블록 위치 조정 후 Resume 버튼으로 같은 pick 좌표에서 재시도 가능.
+        완전 종료는 Resume 없이 새로 Auto 버튼 누르면 됨."""
         self.abort_current_episode = True
-        self.auto_collect_target = 0
+        self._auto_paused = True  # 카운트·위치 유지 (target은 건드리지 않음)
         if self.step_worker and self.step_worker.isRunning():
             self.step_worker.request_stop()
-        self.log("자동 수집 중단 요청")
+        self.log("자동 수집 일시 중단 — 블록 위치 조정 후 [Resume] 버튼을 누르세요.")
+
+    def resume_auto_collect(self):
+        """STOP 후 블록 위치 조정 완료 → 같은 pick 좌표에서 에피소드 재시도."""
+        if not self.robot or not self.robot.connected or not self.gripper:
+            self.log("Connect robot first")
+            return
+        if self.step_worker and self.step_worker.isRunning():
+            self.log("Still running")
+            return
+        self._auto_paused = False
+        self.resume_auto_btn.setVisible(False)
+        remaining = self.auto_collect_target - self.auto_collect_done
+        self.log(f"Resume: 남은 {remaining}개 수집 재개 (pick 위치 유지: "
+                 f"x={self.last_place_x}, y={self.last_place_y})")
+        self._begin_step_ui()
+        self._ensure_camera_for_recording()
+        self._run_next_auto_step()
 
     def _begin_step_ui(self):
         """스텝 시작 시 UI 비활성화"""
@@ -1249,6 +1325,7 @@ class PickPlaceGUINew(QMainWindow):
         for n in (1, 5, 10, 50):
             getattr(self, f"auto_collect_{n}_btn").setEnabled(False)
         self.stop_auto_btn.setEnabled(True)
+        self.resume_auto_btn.setVisible(False)
 
     def _end_step_ui(self, auto_collect_active=False):
         """스텝 종료 시 UI 복원"""
@@ -1290,14 +1367,23 @@ class PickPlaceGUINew(QMainWindow):
                 self.recorded_data.clear()
                 self.record_save_dir = None
         # 이번 스텝 종료 시 중단 플래그는 리셋 (다음 수동/자동 스텝에 영향 없게)
+        was_aborted = self.abort_current_episode
         self.abort_current_episode = False
+
         if self.auto_collect_target > 0:
+            # STOP으로 중단된 경우: 카운트 증가 없이 Resume 버튼 표시
+            if was_aborted and self._auto_paused:
+                self._end_step_ui(auto_collect_active=False)
+                self.resume_auto_btn.setVisible(True)
+                remaining = self.auto_collect_target - self.auto_collect_done
+                self.log(f"일시 중단됨: {self.auto_collect_done}/{self.auto_collect_target} 완료. "
+                         f"블록 조정 후 [Resume] 누르세요. (남은 {remaining}개)")
+                return
             self.auto_collect_done += 1
-            self.log(f"자동 수집: {self.auto_collect_done}/{self.auto_collect_target} 완료 (초기 자세 복귀 → 저장됨)")
+            self.log(f"자동 수집: {self.auto_collect_done}/{self.auto_collect_target} 완료")
             if self.auto_collect_done >= self.auto_collect_target:
                 self._end_auto_collect()
                 return
-            # 다음 스텝 자동 진행 (다음 버튼 없이)
             self.log(f"다음 스텝({self.auto_collect_done + 1}/{self.auto_collect_target}) 자동 시작...")
             QTimer.singleShot(300, self._run_next_auto_step)
         else:
@@ -1313,7 +1399,9 @@ class PickPlaceGUINew(QMainWindow):
     def _end_auto_collect(self):
         self.auto_collect_target = 0
         self.auto_collect_done = 0
+        self._auto_paused = False
         self.episode_next_btn.setVisible(False)
+        self.resume_auto_btn.setVisible(False)
         self._end_step_ui(auto_collect_active=False)
         self.update_status()
         self.log("자동 수집 완료.")
@@ -1340,6 +1428,7 @@ class PickPlaceGUINew(QMainWindow):
         self.step_worker.log_signal.connect(self.log)
         self.step_worker.finished.connect(self.on_pick_place_step_finished)
         self.step_worker.episode_vacuum_durations.connect(self._on_episode_vacuum_durations)
+        self.step_worker.episode_meta_ready.connect(self._on_episode_meta_ready)
         self.step_worker.recording_begin_at_initial.connect(self._start_20hz_recording)
         self.step_worker.start()
 
@@ -1396,9 +1485,11 @@ class PickPlaceGUINew(QMainWindow):
                 self.log(f"Camera auto-start failed: {e}")
 
     def _on_episode_vacuum_durations(self, pick_hold, place_hold):
-        """Vacuum 명령 기반: worker가 emit한 grip/release 유지 시간(s) 저장 → metadata.txt에 기록."""
         self.episode_vacuum_pick_hold = float(pick_hold)
         self.episode_vacuum_place_hold = float(place_hold)
+
+    def _on_episode_meta_ready(self, meta):
+        self._pending_episode_meta = meta
 
     def _start_20hz_recording(self):
         """20Hz 기록 시작: vla_dataset/(다음 번호) 생성, 타이머 시작. (초기 자세 도달 후 호출됨)"""
@@ -1544,24 +1635,57 @@ class PickPlaceGUINew(QMainWindow):
             print(f"[DEBUG] CSV written: {csv_path}")
             npy_path = os.path.join(self.record_save_dir, "dataset.npy")
             np.save(npy_path, self.recorded_data)
-            print(f"[DEBUG] NPY written: {npy_path}")
+
+            # episode_meta.json
+            import json as _json
+            folder_num = os.path.basename(self.record_save_dir)
+            n_frames = len(self.recorded_data)
+            # 실측 fps: 타임스탬프 기반 계산 (QTimer 오버헤드 반영)
+            if n_frames >= 2:
+                actual_fps = round((n_frames - 1) / (self.recorded_data[-1]['timestamp'] - self.recorded_data[0]['timestamp']), 3)
+            else:
+                actual_fps = RECORD_RATE_HZ
+            meta = dict(self._pending_episode_meta)
+            meta.update({
+                "folder": folder_num,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_frames": n_frames,
+                "record_rate_hz": actual_fps,
+                "success": bool(step_success),
+                "vacuum_pick_duration_s": round(self.episode_vacuum_pick_hold, 3),
+                "vacuum_place_duration_s": round(self.episode_vacuum_place_hold, 3),
+            })
+            meta.pop("events", None)  # events는 별도 CSV로 저장
+            meta_json_path = os.path.join(self.record_save_dir, "episode_meta.json")
+            with open(meta_json_path, 'w', encoding='utf-8') as f:
+                _json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            # episode_events.csv (gripper_on/off → 가장 가까운 frame_id 매핑)
+            events_raw = self._pending_episode_meta.get("events", [])
+            if events_raw and self.recorded_data:
+                ts_list = [(r['frame_id'], r['timestamp']) for r in self.recorded_data]
+                events_path = os.path.join(self.record_save_dir, "episode_events.csv")
+                with open(events_path, 'w', newline='', encoding='utf-8') as f:
+                    f.write("event,frame_id,timestamp\n")
+                    for ev_name, ev_ts in events_raw:
+                        closest_fid = min(ts_list, key=lambda t: abs(t[1] - ev_ts))[0]
+                        f.write(f"{ev_name},{closest_fid},{ev_ts:.6f}\n")
+
+            # metadata.txt (호환성 유지)
             meta_path = os.path.join(self.record_save_dir, "metadata.txt")
             with open(meta_path, 'w') as f:
-                folder_num = os.path.basename(self.record_save_dir)
-                f.write("VLA Dataset - Pick-Place Step 20Hz\n")
+                f.write("VLA Dataset - Pick-Place Step\n")
                 f.write("=" * 50 + "\n\n")
                 f.write(f"Folder: {folder_num}\n")
                 f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total Frames: {len(self.recorded_data)}\n")
-                f.write(f"Record Rate: 20Hz\n")
+                f.write(f"Total Frames: {n_frames}\n")
+                f.write(f"Record Rate: {actual_fps}Hz\n")
+                f.write(f"Cameras: HIK+ ZED (LEFT)\n")
                 f.write(f"Step Success: {step_success}\n")
-                f.write(f"Success: {step_success}\n")
-                # Vacuum 명령 기반 (ON 유지 시간, s) — 센서 없을 때 분석용
                 f.write(f"VacuumCommandPickDuration_s: {self.episode_vacuum_pick_hold:.3f}\n")
                 f.write(f"VacuumCommandPlaceDuration_s: {self.episode_vacuum_place_hold:.3f}\n")
-            print(f"[DEBUG] Metadata written: {meta_path}")
-            self.log(f"20Hz saved: {len(self.recorded_data)} frames → {self.record_save_dir}")
-            print(f"[DEBUG] Save complete: {len(self.recorded_data)} frames")
+            self._pending_episode_meta = {}
+            self.log(f"Saved: {n_frames} frames → {self.record_save_dir}")
         except Exception as e:
             self.log(f"20Hz save error: {e}")
 

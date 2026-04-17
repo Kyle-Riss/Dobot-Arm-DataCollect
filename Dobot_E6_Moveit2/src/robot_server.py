@@ -204,6 +204,7 @@ _state = {
     "record_frame_count": 0,
     "vacuum_pick":    0.0,
     "vacuum_place":   0.0,
+    "episode_meta":   {},
     "auto_target":    0,
     "auto_done":      0,
     "pick_section":   "A",
@@ -216,7 +217,7 @@ _ws_clients: Set[WebSocket] = set()
 _log_queue: asyncio.Queue   = None
 _main_loop: asyncio.AbstractEventLoop = None
 
-FIXED_INIT = (89.3715, -102.9836, 611.7122, 90.1244, 3.6761, 5.7400)
+FIXED_INIT = (89.3715, -378.5400, 250.0000, -179.5275, -2.4369, 2.3663)
 
 ROBOT_MODE_LABELS = {
     1:"INIT", 2:"BRAKE_OPEN", 4:"DISABLED", 5:"ENABLE",
@@ -252,17 +253,20 @@ def _log(msg: str):
         except Exception:
             pass
 
+_SAFE_INIT_FALLBACK_XYZ = (89.3715, -378.5400, 250.0)  # 실측 검증된 안전 대기 위치
+
 def _set_random_init_pose(robot):
     rx, ry, rz = INIT_SAFE_RX, INIT_SAFE_RY, INIT_SAFE_RZ
-    cx = cy = cz = 0.0
+    cx, cy, cz = _SAFE_INIT_FALLBACK_XYZ
     ok = False
     for _ in range(30):
-        cx, cy, cz, *_ = generate_random_initial_pose()
+        tx, ty, tz, *_ = generate_random_initial_pose()
         if robot and robot.connected:
-            ok, _ = robot.check_ik_solution(cx, cy, cz, rx, ry, rz)
+            ok, _ = robot.check_ik_solution(tx, ty, tz, rx, ry, rz)
         else:
             ok = True
         if ok:
+            cx, cy, cz = tx, ty, tz
             break
     base.INIT_X = cx;  base.INIT_Y = cy;  base.INIT_Z = cz
     base.INIT_RX = rx; base.INIT_RY = ry; base.INIT_RZ = rz
@@ -500,17 +504,48 @@ def _stop_and_save(success: bool):
                 f.write(f",{r['gripper_tooldo1']},{r['gripper_tooldo2']},{r['robot_mode']}\n")
         # NPY
         np.save(os.path.join(save_dir, "dataset.npy"), data)
-        # metadata
+        # episode_meta.json
+        import json as _json
+        folder_num = os.path.basename(save_dir)
+        n_frames = len(data)
+        if n_frames >= 2:
+            actual_fps = round((n_frames - 1) / (data[-1]['timestamp'] - data[0]['timestamp']), 3)
+        else:
+            actual_fps = 15.0
+        ep_meta = dict(_state.get("episode_meta") or {})
+        ep_meta.update({
+            "folder": folder_num,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_frames": n_frames,
+            "record_rate_hz": actual_fps,
+            "cameras": "HIK+ZED" if has_zed else "HIK",
+            "success": bool(success),
+            "vacuum_pick_duration_s": round(_state['vacuum_pick'], 3),
+            "vacuum_place_duration_s": round(_state['vacuum_place'], 3),
+        })
+        events_raw = ep_meta.pop("events", [])
+        with open(os.path.join(save_dir, "episode_meta.json"), 'w', encoding='utf-8') as f:
+            _json.dump(ep_meta, f, ensure_ascii=False, indent=2)
+        # episode_events.csv
+        if events_raw and data:
+            ts_list = [(r['frame_id'], r['timestamp']) for r in data]
+            with open(os.path.join(save_dir, "episode_events.csv"), 'w', newline='') as f:
+                f.write("event,frame_id,timestamp\n")
+                for ev_name, ev_ts in events_raw:
+                    closest_fid = min(ts_list, key=lambda t: abs(t[1] - ev_ts))[0]
+                    f.write(f"{ev_name},{closest_fid},{ev_ts:.6f}\n")
+        # metadata.txt (호환성 유지)
         with open(os.path.join(save_dir, "metadata.txt"), 'w') as f:
-            f.write("VLA Dataset - Pick-Place Step 20Hz\n" + "="*50 + "\n\n")
-            f.write(f"Folder: {os.path.basename(save_dir)}\n")
+            f.write("VLA Dataset - Pick-Place Step\n" + "="*50 + "\n\n")
+            f.write(f"Folder: {folder_num}\n")
             f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Total Frames: {len(data)}\n")
-            f.write(f"Record Rate: 20Hz\n")
+            f.write(f"Record Rate: {actual_fps}Hz\n")
             f.write(f"Cameras: HIK{'+ ZED (LEFT)' if has_zed else ' only'}\n")
             f.write(f"Step Success: {success}\n")
             f.write(f"VacuumCommandPickDuration_s: {_state['vacuum_pick']:.3f}\n")
             f.write(f"VacuumCommandPlaceDuration_s: {_state['vacuum_place']:.3f}\n")
+        _state["episode_meta"] = {}
         _log(f"Saved {len(data)} frames → {save_dir}")
     except Exception as e:
         _log(f"Save error: {e}")
@@ -524,6 +559,7 @@ def _stop_and_save(success: bool):
 def _on_log(msg):    _log(msg)
 def _on_vacuum(ph, pl): _state["vacuum_pick"] = ph; _state["vacuum_place"] = pl
 def _on_rec_begin():  _start_recording()
+def _on_episode_meta(meta): _state["episode_meta"] = meta
 
 def _on_finished(success: bool):
     _stop_and_save(success)
@@ -535,6 +571,11 @@ def _on_finished(success: bool):
         _log(f"Place ({w.place_x:.1f},{w.place_y:.1f}) / next: {_state['pick_section']}")
 
     if _state["auto_target"] > 0:
+        if not success:
+            # STOP 또는 실패 → 자동 수집 중단, 카운트 증가 없음
+            _state.update(auto_target=0, auto_done=0)
+            _log("⚠ 자동 수집 중단됨 (실패/STOP)")
+            return
         _state["auto_done"] += 1
         _log(f"Auto {_state['auto_done']}/{_state['auto_target']}")
         if _state["auto_done"] >= _state["auto_target"]:
@@ -567,6 +608,7 @@ def _run_step():
     worker.log_signal.connect(_on_log)
     worker.finished.connect(_on_finished)
     worker.episode_vacuum_durations.connect(_on_vacuum)
+    worker.episode_meta_ready.connect(_on_episode_meta)
     worker.recording_begin_at_initial.connect(_on_rec_begin)
     _state["worker"] = worker
     worker.start()
@@ -660,6 +702,21 @@ def clear_alarm():
         _log(f"ClearError failed: {e}")
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
+@app.post("/resume")
+def resume_robot():
+    robot = _state["robot"]
+    if not robot or not robot.connected:
+        return JSONResponse({"ok": False, "msg": "Not connected"}, status_code=400)
+    try:
+        robot.resume_robot()
+        robot.clear_error()
+        robot.enable_robot(sleep_after=0.1)
+        _log("Resume → ClearError + EnableRobot 완료")
+        return {"ok": True}
+    except Exception as e:
+        _log(f"Resume failed: {e}")
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
 @app.post("/disconnect")
 def disconnect():
     if _state["robot"]:
@@ -728,16 +785,50 @@ def move(x: float, y: float, z: float,
     threading.Thread(target=_do, daemon=True).start()
     return {"ok": True}
 
+_jog_lock = threading.Lock()
+_jog_axis_active: list = [None]   # [0] = currently jogging axis or None
+_jog_stop_time: list  = [0.0]     # [0] = last stop timestamp
+
 @app.post("/jog/start")
-def jog_start(axis: str):
+def jog_start(axis: str, speed: int = 20):
     robot = _state["robot"]
     if not robot or not robot.connected:
         return JSONResponse({"ok": False, "msg": "Not connected"}, status_code=400)
+    speed = max(1, min(100, speed))
     def _do():
-        if axis.startswith('J'):
-            robot.dashboard.MoveJog(axis)
-        else:
-            robot.dashboard.MoveJog(axis, coordtype=1, user=0, tool=0)
+        with _jog_lock:
+            # cooldown: wait until 200ms after last stop
+            elapsed = time.time() - _jog_stop_time[0]
+            if elapsed < 0.20:
+                time.sleep(0.20 - elapsed)
+            try:
+                robot.dashboard.EnableRobot()
+            except Exception:
+                pass
+            try:
+                robot.dashboard.SpeedFactor(speed)
+            except Exception:
+                pass
+            for attempt in range(2):
+                try:
+                    if axis.startswith('J'):
+                        result = robot.dashboard.MoveJog(axis)
+                    else:
+                        result = robot.dashboard.MoveJog(axis, coordtype=1, user=0, tool=0)
+                    result_str = str(result).strip() if result else ""
+                    first = result_str.split(',')[0].strip() if result_str else ""
+                    if first and first != "0":
+                        if attempt == 0:
+                            time.sleep(0.15)
+                            continue  # retry once
+                        _log(f"[jog] {axis} error: {result_str}")
+                    else:
+                        _jog_axis_active[0] = axis
+                        _log(f"[jog] {axis} start (speed={speed}%)")
+                    break
+                except Exception as e:
+                    _log(f"[jog] {axis} exception: {e}")
+                    break
     threading.Thread(target=_do, daemon=True).start()
     return {"ok": True}
 
@@ -745,8 +836,38 @@ def jog_start(axis: str):
 def jog_stop():
     robot = _state["robot"]
     if robot and robot.connected:
-        threading.Thread(target=lambda: robot.dashboard.MoveJog(""), daemon=True).start()
+        def _stop():
+            with _jog_lock:
+                try:
+                    robot.dashboard.MoveJog("")
+                except Exception as e:
+                    _log(f"[jog] stop error: {e}")
+                try:
+                    robot.dashboard.SpeedFactor(100)
+                except Exception:
+                    pass
+                was = _jog_axis_active[0]
+                _jog_axis_active[0] = None
+                _jog_stop_time[0] = time.time()
+                if was:
+                    _log(f"[jog] {was} stopped")
+        threading.Thread(target=_stop, daemon=True).start()
     return {"ok": True}
+
+@app.get("/pose")
+def get_pose():
+    """현재 TCP 좌표 반환 (조그 후 위치 확인용)."""
+    robot = _state["robot"]
+    if not robot or not robot.connected:
+        return JSONResponse({"ok": False, "msg": "Not connected"}, status_code=400)
+    try:
+        pose = robot.get_current_pose_from_feedback()
+        if pose and len(pose) >= 6:
+            return {"ok": True, "x": round(pose[0],3), "y": round(pose[1],3), "z": round(pose[2],3),
+                    "rx": round(pose[3],3), "ry": round(pose[4],3), "rz": round(pose[5],3)}
+        return JSONResponse({"ok": False, "msg": "No pose data"}, status_code=503)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 @app.post("/gripper/grip")
 def grip():
@@ -909,71 +1030,115 @@ _HTML = r"""<!DOCTYPE html>
 <title>Dobot E6 Server</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#12121f;color:#dde;font-size:13px}
-h1{text-align:center;padding:8px;background:#0e0e1d;color:#00c8e8;font-size:1.1rem;letter-spacing:1px}
+body{font-family:'Segoe UI',sans-serif;background:#12121f;color:#dde;font-size:13px;min-width:900px}
+h1{text-align:center;padding:9px;background:#0e0e1d;color:#00c8e8;font-size:1.05rem;letter-spacing:1px;border-bottom:1px solid #1e2a3a}
+
 /* 3-column layout */
-.layout{display:grid;grid-template-columns:290px 1fr 1fr;gap:8px;padding:8px}
-.col{display:flex;flex-direction:column;gap:8px}
-.card{background:#1a1a30;border-radius:6px;padding:10px}
-h3{color:#00c8e8;font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
-.row{display:flex;gap:5px;margin-bottom:6px;align-items:center}
+.layout{display:grid;grid-template-columns:300px 1fr 340px;gap:8px;padding:8px;align-items:start}
+.col{display:flex;flex-direction:column;gap:8px;min-width:0}
+
+/* card */
+.card{background:#1a1a30;border-radius:7px;padding:11px;overflow:hidden}
+h3{color:#00c8e8;font-size:.7rem;text-transform:uppercase;letter-spacing:.6px;margin-bottom:9px;border-bottom:1px solid #1e2a3a;padding-bottom:5px}
+
+/* row, inputs, buttons */
+.row{display:flex;gap:5px;margin-bottom:6px;align-items:center;flex-wrap:wrap}
 input[type=text],input[type=number]{background:#0d1a2e;color:#dde;border:1px solid #2a4a6a;
-  padding:4px 7px;border-radius:4px;flex:1;font-size:.8rem}
+  padding:4px 7px;border-radius:4px;flex:1;min-width:0;font-size:.8rem}
 button{background:#0d1a2e;color:#aac8e0;border:1px solid #2a4a6a;padding:5px 10px;
-  border-radius:4px;cursor:pointer;font-size:.78rem;white-space:nowrap}
+  border-radius:4px;cursor:pointer;font-size:.78rem;white-space:nowrap;transition:background .12s}
 button:hover{background:#00c8e8;color:#0d1a2e;border-color:#00c8e8}
+button:active{filter:brightness(1.3)}
 .btn-g{border-color:#2dc653;color:#2dc653}.btn-g:hover{background:#2dc653;color:#0d1a2e}
 .btn-r{border-color:#e63946;color:#e63946}.btn-r:hover{background:#e63946;color:#fff}
 .btn-y{border-color:#f4a261;color:#f4a261}.btn-y:hover{background:#f4a261;color:#0d1a2e}
+
+/* status bars */
 .sbar{background:#0d1a2e;padding:5px 9px;border-radius:4px;font-size:.72rem;margin-bottom:5px}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:middle}
 .on{background:#2dc653}.off{background:#e63946}.rec{background:#e63946;animation:blink 1s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-/* Camera streams side-by-side */
-.cam-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.cam-box{background:#0d1a2e;border-radius:5px;overflow:hidden}
-.cam-label{font-size:.65rem;color:#446;padding:3px 6px;background:#0a0f1e}
-img.stream{width:100%;height:200px;object-fit:cover;display:block}
-#log{background:#060612;font-family:monospace;font-size:.68rem;height:130px;overflow-y:auto;
-  padding:6px;border-radius:4px;color:#6fdf8f}
-/* Dashboard */
+
+/* dashboard grid */
 .dash-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
-.dash-cell{background:#0d1a2e;border-radius:4px;padding:5px 6px;text-align:center}
-.dash-label{font-size:.6rem;color:#668;text-transform:uppercase}
-.dash-val{font-size:.9rem;font-weight:700;color:#00c8e8;font-family:monospace}
-/* Jog */
-.jog-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin-bottom:4px}
-.jog-btn{padding:4px 2px;font-size:.68rem;text-align:center}
-.sep{border-top:1px solid #1e2a3a;margin:6px 0}
-.sub{font-size:.63rem;color:#446;margin-bottom:3px}
+.dash-cell{background:#0d1a2e;border-radius:4px;padding:5px 4px;text-align:center}
+.dash-label{font-size:.58rem;color:#557;text-transform:uppercase}
+.dash-val{font-size:.88rem;font-weight:700;color:#00c8e8;font-family:monospace}
+
+/* cameras */
+.cam-row{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.cam-box{background:#0d1a2e;border-radius:5px;overflow:hidden}
+.cam-label{font-size:.63rem;color:#446;padding:3px 6px;background:#0a0f1e}
+img.stream{width:100%;height:480px;object-fit:contain;display:block;background:#000}
+
+/* log */
+#log{background:#060612;font-family:monospace;font-size:.67rem;height:140px;overflow-y:auto;
+  padding:6px;border-radius:4px;color:#6fdf8f;word-break:break-all}
+
+/* separator */
+.sep{border-top:1px solid #1e2a3a;margin:8px 0}
+.sub{font-size:.63rem;color:#557;margin-bottom:5px;margin-top:2px}
+
+/* ── JOG ── */
+/* D-pad: 3×3 grid */
+.dpad{display:grid;grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,40px);gap:4px}
+.dpad .jb{font-size:.9rem;font-weight:700;padding:0;display:flex;align-items:center;justify-content:center;
+  border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
+.dpad .jb.center{background:#1e2a3a;color:#446;font-size:.6rem;cursor:default;border:1px solid #1e2a3a}
+.dpad .jb.center:hover{background:#1e2a3a;color:#446;border-color:#1e2a3a}
+
+/* Z col */
+.zcol{display:flex;flex-direction:column;gap:4px;margin-left:8px}
+.zcol .jb{width:48px;height:40px;font-size:.85rem;font-weight:700;display:flex;align-items:center;
+  justify-content:center;border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
+
+/* rotation row */
+.rot-row{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
+.rot-row .jb{padding:5px 2px;font-size:.72rem;text-align:center;font-weight:600;
+  border-radius:4px;user-select:none;-webkit-user-select:none;touch-action:none}
+
+/* joint row */
+.joint-table{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
+.joint-table .jb{padding:6px 2px;font-size:.72rem;text-align:center;
+  border-radius:4px;user-select:none;-webkit-user-select:none;touch-action:none}
+
+/* active jog highlight */
+.jb.jogging{background:#00c8e8 !important;color:#0d1a2e !important;border-color:#00c8e8 !important}
+
+/* speed slider */
+input[type=range]{width:100%;accent-color:#00c8e8}
+
+/* pose capture */
+#pose-display{font-size:.68rem;color:#9cf;margin-top:4px;font-family:monospace;word-break:break-all;min-height:16px}
 </style>
 </head>
 <body>
 <h1>⬡ Dobot E6 — Robot Control &amp; Data Collection</h1>
 <div class="layout">
 
-<!-- ── 왼쪽 컬럼: 연결 + 대시보드 + 데이터수집 ── -->
+<!-- ══════════════ LEFT COL ══════════════ -->
 <div class="col">
 
-  <!-- 연결 -->
+  <!-- Connection -->
   <div class="card">
     <h3>Connection</h3>
     <div class="row">
-      <input id="ip" type="text" value="192.168.5.1" style="max-width:120px">
+      <input id="ip" type="text" value="192.168.5.1" style="max-width:115px">
       <button class="btn-g" onclick="api('POST','/connect',{ip:$('ip').value})">Connect</button>
       <button onclick="api('POST','/disconnect')">Disconnect</button>
     </div>
-    <div id="conn-bar" class="sbar"><span class="dot off" id="cd"></span>Disconnected</div>
-    <div id="mode-bar" class="sbar" style="margin-bottom:6px">Mode: —</div>
-    <div class="row" style="margin-bottom:0">
+    <div id="conn-bar" class="sbar"><span class="dot off"></span>Disconnected</div>
+    <div id="mode-bar" class="sbar" style="margin-bottom:7px">Mode: —</div>
+    <div class="row" style="margin-bottom:0;gap:4px">
       <button class="btn-g" onclick="api('POST','/enable')">Enable</button>
       <button onclick="api('POST','/disable')">Disable</button>
       <button class="btn-y" onclick="clearAlarm()">Clear Alarm</button>
+      <button class="btn-y" onclick="api('POST','/resume').then(()=>addLog('▶ Resume sent'))">Resume</button>
       <button onclick="api('POST','/home')">Home</button>
     </div>
   </div>
 
-  <!-- 대시보드 -->
+  <!-- Dashboard -->
   <div class="card">
     <h3>Robot Dashboard</h3>
     <div class="sub">TCP Pose (mm / deg)</div>
@@ -985,7 +1150,7 @@ img.stream{width:100%;height:200px;object-fit:cover;display:block}
       <div class="dash-cell"><div class="dash-label">RY</div><div class="dash-val" id="dRY">—</div></div>
       <div class="dash-cell"><div class="dash-label">RZ</div><div class="dash-val" id="dRZ">—</div></div>
     </div>
-    <div class="sub" style="margin-top:7px">Joint Angles (deg)</div>
+    <div class="sub" style="margin-top:8px">Joint Angles (deg)</div>
     <div class="dash-grid">
       <div class="dash-cell"><div class="dash-label">J1</div><div class="dash-val" id="dJ1">—</div></div>
       <div class="dash-cell"><div class="dash-label">J2</div><div class="dash-val" id="dJ2">—</div></div>
@@ -996,56 +1161,56 @@ img.stream{width:100%;height:200px;object-fit:cover;display:block}
     </div>
   </div>
 
-  <!-- 데이터 수집 -->
+  <!-- Data Collection -->
   <div class="card">
     <h3>Data Collection</h3>
     <div id="auto-bar" class="sbar">Ready</div>
     <div class="row">
       <button class="btn-g" onclick="api('POST','/pick-place/step')">▶ Step</button>
-      <input id="auto-n" type="number" value="10" min="1" style="max-width:50px">
-      <button class="btn-g" onclick="autoCollect()">▶ Auto</button>
+      <input id="auto-n" type="number" value="10" min="1" style="max-width:55px">
+      <button class="btn-g" onclick="autoCollect()">▶ Auto (n)</button>
       <button class="btn-y" onclick="api('POST','/pick-place/stop')">■ Stop</button>
     </div>
-    <button class="btn-r" style="width:100%;padding:7px;margin-top:2px" onclick="doEstop()">⚠ E-STOP</button>
+    <button class="btn-r" style="width:100%;padding:8px;font-size:.82rem;font-weight:700" onclick="doEstop()">⚠ E-STOP</button>
   </div>
 
 </div><!-- end left col -->
 
-<!-- ── 가운데 컬럼: 카메라 스트림 + 카메라 컨트롤 ── -->
+<!-- ══════════════ CENTER COL ══════════════ -->
 <div class="col">
 
-  <!-- 카메라 컨트롤 -->
+  <!-- Camera controls -->
   <div class="card">
     <h3>Exterior Cameras</h3>
     <div class="row" style="margin-bottom:4px">
-      <span style="font-size:.72rem;color:#00c8e8;min-width:100px">Ext Cam 1 (HIK)</span>
+      <span style="font-size:.72rem;color:#00c8e8;min-width:105px">Cam 1 — HIKRobot</span>
       <button class="btn-g" onclick="api('POST','/camera/hik/start')">Start</button>
       <button onclick="api('POST','/camera/hik/stop')">Stop</button>
-      <span id="hik-stat" style="font-size:.72rem;color:#668;margin-left:5px">OFF</span>
+      <span id="hik-stat" style="font-size:.72rem;color:#668;margin-left:6px">OFF</span>
     </div>
     <div class="row" style="margin-bottom:0">
-      <span style="font-size:.72rem;color:#00c8e8;min-width:100px">Ext Cam 2 (ZED)</span>
+      <span style="font-size:.72rem;color:#00c8e8;min-width:105px">Cam 2 — ZED</span>
       <button class="btn-g" onclick="api('POST','/camera/zed/start')">Start</button>
       <button onclick="api('POST','/camera/zed/stop')">Stop</button>
-      <span id="zed-stat" style="font-size:.72rem;color:#668;margin-left:5px">OFF</span>
+      <span id="zed-stat" style="font-size:.72rem;color:#668;margin-left:6px">OFF</span>
     </div>
   </div>
 
-  <!-- 카메라 스트림 2개 나란히 -->
+  <!-- Camera streams -->
   <div class="card" style="padding:8px">
     <div class="cam-row">
       <div class="cam-box">
-        <div class="cam-label">Ext Cam 1 — HIKRobot</div>
+        <div class="cam-label">Cam 1 — HIKRobot</div>
         <img class="stream" src="/camera/hik/stream" alt="HIK">
       </div>
       <div class="cam-box">
-        <div class="cam-label">Ext Cam 2 — ZED (LEFT)</div>
+        <div class="cam-label">Cam 2 — ZED (LEFT)</div>
         <img class="stream" src="/camera/zed/stream" alt="ZED">
       </div>
     </div>
   </div>
 
-  <!-- 로그 -->
+  <!-- Log -->
   <div class="card">
     <h3>Log</h3>
     <div id="log"></div>
@@ -1053,24 +1218,90 @@ img.stream{width:100%;height:200px;object-fit:cover;display:block}
 
 </div><!-- end center col -->
 
-<!-- ── 오른쪽 컬럼: Jog ── -->
+<!-- ══════════════ RIGHT COL: JOG ══════════════ -->
 <div class="col">
-
-  <!-- Jog -->
   <div class="card">
     <h3>Jog Control</h3>
-    <div class="row" style="margin-bottom:6px">
-      <button class="btn-g" onclick="api('POST','/gripper/grip')">Grip ON</button>
-      <button onclick="api('POST','/gripper/release')">Grip OFF</button>
-    </div>
-    <div class="sep"></div>
-    <div class="sub">TCP Jog (hold → release to stop)</div>
-    <div class="jog-grid" id="tcp-jog"></div>
-    <div class="sep"></div>
-    <div class="sub">Joint Jog (hold → release to stop)</div>
-    <div class="jog-grid" id="joint-jog"></div>
-  </div>
 
+    <!-- Gripper -->
+    <div class="row" style="margin-bottom:7px">
+      <button class="btn-g" style="flex:1;padding:7px" onclick="api('POST','/gripper/grip')">Grip ON [Q]</button>
+      <button style="flex:1;padding:7px" onclick="api('POST','/gripper/release')">Grip OFF [W]</button>
+    </div>
+
+    <!-- Speed -->
+    <div style="margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+        <span style="font-size:.73rem;color:#aac8e0;font-weight:600">Jog Speed</span>
+        <span style="font-size:.82rem;font-weight:700;color:#00c8e8"><span id="speed-val">5</span>%</span>
+      </div>
+      <input type="range" id="jog-speed" min="1" max="50" value="5"
+             oninput="$('speed-val').textContent=this.value">
+    </div>
+
+    <!-- Capture pose -->
+    <div style="margin-bottom:8px">
+      <button onclick="capturePose()" style="width:100%;padding:6px;font-size:.75rem;background:#263445;border-color:#3a5a7a;color:#9cf">
+        📍 현재 좌표 캡처
+      </button>
+      <div id="pose-display"></div>
+    </div>
+
+    <div class="sep"></div>
+
+    <!-- TCP XY D-pad + Z -->
+    <div class="sub">TCP XY / Z &nbsp;·&nbsp; 키보드: ←→↑↓ / Z=Z+ X=Z-</div>
+    <div style="display:flex;align-items:center;margin-bottom:8px">
+      <!-- D-pad 3×3 -->
+      <div class="dpad">
+        <div></div>
+        <button class="jb btn-g" id="jb-Y+" data-axis="Y+">↑<br><small style="font-size:.55rem">Y+</small></button>
+        <div></div>
+        <button class="jb btn-g" id="jb-X+" data-axis="X+">←<br><small style="font-size:.55rem">X+</small></button>
+        <div class="jb center">XY</div>
+        <button class="jb btn-g" id="jb-X-" data-axis="X-">→<br><small style="font-size:.55rem">X-</small></button>
+        <div></div>
+        <button class="jb btn-g" id="jb-Y-" data-axis="Y-">↓<br><small style="font-size:.55rem">Y-</small></button>
+        <div></div>
+      </div>
+      <!-- Z col -->
+      <div class="zcol">
+        <button class="jb btn-g" id="jb-Z+" data-axis="Z+">Z+<br><small style="font-size:.55rem">▲</small></button>
+        <button class="jb btn-g" id="jb-Z-" data-axis="Z-">Z-<br><small style="font-size:.55rem">▼</small></button>
+      </div>
+    </div>
+
+    <!-- Rotation -->
+    <div class="sub">Rotation (Rx / Ry / Rz)</div>
+    <div class="rot-row" style="margin-bottom:8px">
+      <button class="jb" id="jb-Rx+" data-axis="Rx+">Rx+</button>
+      <button class="jb" id="jb-Rx-" data-axis="Rx-">Rx-</button>
+      <button class="jb" id="jb-Ry+" data-axis="Ry+">Ry+</button>
+      <button class="jb" id="jb-Ry-" data-axis="Ry-">Ry-</button>
+      <button class="jb" id="jb-Rz+" data-axis="Rz+">Rz+</button>
+      <button class="jb" id="jb-Rz-" data-axis="Rz-">Rz-</button>
+    </div>
+
+    <div class="sep"></div>
+
+    <!-- Joint jog -->
+    <div class="sub">Joint Jog</div>
+    <div class="joint-table">
+      <button class="jb" id="jb-J1+" data-axis="J1+">J1+</button>
+      <button class="jb" id="jb-J1-" data-axis="J1-">J1-</button>
+      <button class="jb" id="jb-J2+" data-axis="J2+">J2+</button>
+      <button class="jb" id="jb-J2-" data-axis="J2-">J2-</button>
+      <button class="jb" id="jb-J3+" data-axis="J3+">J3+</button>
+      <button class="jb" id="jb-J3-" data-axis="J3-">J3-</button>
+      <button class="jb" id="jb-J4+" data-axis="J4+">J4+</button>
+      <button class="jb" id="jb-J4-" data-axis="J4-">J4-</button>
+      <button class="jb" id="jb-J5+" data-axis="J5+">J5+</button>
+      <button class="jb" id="jb-J5-" data-axis="J5-">J5-</button>
+      <button class="jb" id="jb-J6+" data-axis="J6+">J6+</button>
+      <button class="jb" id="jb-J6-" data-axis="J6-">J6-</button>
+    </div>
+
+  </div>
 </div><!-- end right col -->
 
 </div><!-- end layout -->
@@ -1085,7 +1316,7 @@ const api = async (m, p, q={}) => {
     if (data && data.msg) addLog((data.ok ? '✓ ' : '✗ ') + data.msg);
     if (!res.ok && !data.msg) addLog(`✗ ${m} ${p} → HTTP ${res.status}`);
     return data;
-  } catch(e) { addLog('✗ Network error: ' + e); }
+  } catch(e) { addLog('✗ Network: ' + e); }
 };
 const addLog = msg => {
   const b=$('log'); b.innerHTML += msg+'<br>'; b.scrollTop=b.scrollHeight;
@@ -1097,29 +1328,38 @@ ws.onmessage = e => addLog(e.data);
 ws.onopen = () => addLog('[WS] connected');
 setInterval(() => { if(ws.readyState===1) ws.send('ping'); }, 10000);
 
-// 상태 폴링
+// Status polling
 setInterval(async () => {
   const s = await api('GET','/status');
   if(!s) return;
-  $('conn-bar').innerHTML = `<span class="dot ${s.connected?'on':'off'}" id="cd"></span>`
+  $('conn-bar').innerHTML = `<span class="dot ${s.connected?'on':'off'}"></span>`
     + (s.connected ? 'Connected' : 'Disconnected')
-    + (s.recording ? ' &nbsp;<span class="dot rec"></span> REC' : '');
-  $('mode-bar').textContent = 'Mode: ' + (s.robot_mode_str||'—')
+    + (s.recording ? ' &nbsp;<span class="dot rec"></span><b> REC</b>' : '');
+
+  // 로봇 MODE 표시 — ERROR(9)면 빨간 경고
+  const isError = s.robot_mode === 9;
+  $('mode-bar').textContent = (isError ? '⚠ ROBOT ERROR — ' : 'Mode: ')
+    + (s.robot_mode_str||'—')
     + (s.recording ? ` | REC ${s.frames??''}f` : '');
-  if(s.joints){
-    ['J1','J2','J3','J4','J5','J6'].forEach((k,i)=>{
-      const el=$('d'+k); if(el) el.textContent=s.joints[i]?.toFixed(1)??'—';
-    });
+  $('mode-bar').style.background = isError ? '#3a0a0a' : '#0d1a2e';
+  $('mode-bar').style.color      = isError ? '#ff4444' : '#dde';
+  $('mode-bar').style.fontWeight = isError ? '700' : 'normal';
+
+  // ERROR 상태면 자동 수집 서버 측 중단 알림
+  if (isError && s.auto_target > 0) {
+    addLog('⚠ [ERROR] 로봇 충돌/알람 감지 — 자동 수집 중단됨. Clear Alarm 후 재시작하세요.');
+    api('POST','/pick-place/stop');
   }
-  if(s.pose){
-    ['X','Y','Z','RX','RY','RZ'].forEach((k,i)=>{
-      const el=$('d'+k); if(el) el.textContent=s.pose[i]?.toFixed(1)??'—';
-    });
-  }
+  if(s.joints) ['J1','J2','J3','J4','J5','J6'].forEach((k,i)=>{
+    const el=$('d'+k); if(el) el.textContent=s.joints[i]?.toFixed(1)??'—';
+  });
+  if(s.pose) ['X','Y','Z','RX','RY','RZ'].forEach((k,i)=>{
+    const el=$('d'+k); if(el) el.textContent=s.pose[i]?.toFixed(1)??'—';
+  });
   $('hik-stat').textContent = s.cam_hik ? 'ON ●' : 'OFF';
-  $('hik-stat').style.color = s.cam_hik ? '#2dc653' : '#668';
-  $('zed-stat').textContent = s.cam_zed ? 'ON ●' : 'OFF';
-  $('zed-stat').style.color = s.cam_zed ? '#2dc653' : '#668';
+  $('hik-stat').style.color  = s.cam_hik ? '#2dc653' : '#668';
+  $('zed-stat').textContent  = s.cam_zed ? 'ON ●' : 'OFF';
+  $('zed-stat').style.color  = s.cam_zed ? '#2dc653' : '#668';
   if(s.auto_target > 0)
     $('auto-bar').textContent = `Auto: ${s.auto_done}/${s.auto_target}`;
   else if(s.worker_running)
@@ -1128,31 +1368,72 @@ setInterval(async () => {
     $('auto-bar').textContent = 'Ready';
 }, 800);
 
-// Jog 버튼 생성
-const TCP_AXES   = ['X+','X-','Y+','Y-','Z+','Z-','Rx+','Rx-','Ry+','Ry-','Rz+','Rz-'];
-const JOINT_AXES = ['J1+','J1-','J2+','J2-','J3+','J3-','J4+','J4-','J5+','J5-','J6+','J6-'];
-const makeJog = (container, axes) => {
-  const el = $(container);
-  axes.forEach(ax => {
-    const b = document.createElement('button');
-    b.textContent = ax; b.className = 'jog-btn';
-    b.addEventListener('mousedown',  () => api('POST','/jog/start',{axis:ax}));
-    b.addEventListener('touchstart', () => api('POST','/jog/start',{axis:ax}));
-    b.addEventListener('mouseup',    () => api('POST','/jog/stop'));
-    b.addEventListener('touchend',   () => api('POST','/jog/stop'));
-    b.addEventListener('mouseleave', () => api('POST','/jog/stop'));
-    el.appendChild(b);
-  });
-};
-makeJog('tcp-jog',   TCP_AXES);
-makeJog('joint-jog', JOINT_AXES);
+// ── Jog logic ──────────────────────────────
+const getSpeed = () => parseInt($('jog-speed').value) || 5;
+let _jogAxis = null;  // currently held axis (prevents duplicate stop calls)
 
-// 버튼 핸들러
+const jogStart = axis => {
+  if (_jogAxis === axis) return;  // already jogging this axis
+  _jogAxis = axis;
+  const el = document.getElementById('jb-' + axis);
+  if (el) el.classList.add('jogging');
+  api('POST','/jog/start',{axis, speed:getSpeed()});
+};
+const jogStop = () => {
+  if (!_jogAxis) return;  // nothing to stop
+  const el = document.getElementById('jb-' + _jogAxis);
+  if (el) el.classList.remove('jogging');
+  _jogAxis = null;
+  api('POST','/jog/stop');
+};
+
+// Attach events to all .jb buttons with data-axis
+document.querySelectorAll('.jb[data-axis]').forEach(btn => {
+  const ax = btn.dataset.axis;
+  btn.addEventListener('mousedown',  e => { e.preventDefault(); jogStart(ax); });
+  btn.addEventListener('touchstart', e => { e.preventDefault(); jogStart(ax); });
+  btn.addEventListener('mouseup',    () => jogStop());
+  btn.addEventListener('touchend',   () => jogStop());
+  btn.addEventListener('mouseleave', () => { if(_jogAxis===ax) jogStop(); });
+});
+
+// Keyboard jog
+const KEY_MAP = {
+  'ArrowLeft':'X+', 'ArrowRight':'X-',
+  'ArrowUp':'Y+',   'ArrowDown':'Y-',
+  'z':'Z+', 'Z':'Z+',
+  'x':'Z-', 'X':'Z-',
+};
+document.addEventListener('keydown', e => {
+  if (e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+  if (e.repeat) return;
+  const k = e.key;
+  if (k==='q'||k==='Q') { api('POST','/gripper/grip'); return; }
+  if (k==='w'||k==='W') { api('POST','/gripper/release'); return; }
+  const ax = KEY_MAP[k];
+  if (ax) { jogStart(ax); e.preventDefault(); }
+});
+document.addEventListener('keyup', e => {
+  const ax = KEY_MAP[e.key];
+  if (ax && _jogAxis===ax) { jogStop(); e.preventDefault(); }
+});
+window.addEventListener('blur', () => jogStop());
+
+// Capture pose
+const capturePose = async () => {
+  const d = await api('GET','/pose');
+  if(d && d.ok)
+    $('pose-display').textContent = `X:${d.x}  Y:${d.y}  Z:${d.z} | Rx:${d.rx}  Ry:${d.ry}  Rz:${d.rz}`;
+  else
+    $('pose-display').textContent = 'fetch failed';
+};
+
+// Misc handlers
 const autoCollect = () => api('POST','/pick-place/auto',{n:$('auto-n').value});
 const doEstop = () => { if(confirm('E-STOP?')) api('POST','/estop'); };
 const clearAlarm = async () => {
   const d = await api('POST','/clear-alarm');
-  if(d && d.ok) addLog('✓ Alarm cleared — check Mode (ERROR persists if cause unresolved)');
+  if(d&&d.ok) addLog('✓ Alarm cleared');
 };
 </script>
 </body>

@@ -15,6 +15,7 @@ with open(ROOT / "_episode_direction_classification.csv", encoding="utf-8") as f
         CLASS[int(r["episode"])] = r
 
 LOW_Z = 112.0
+MIN_SEG_FRAMES = 10  # 15Hz 기준 667ms 미만 저점은 노이즈로 제거
 INIT_MOTION = 3.0
 INIT_HOLD_CAP = 25
 
@@ -49,7 +50,7 @@ def low_z_segs(rows):
             on = False
     if on:
         segs.append((s, len(rows) - 1))
-    return [(a, b) for a, b in segs if b - a + 1 >= 2]
+    return [(a, b) for a, b in segs if b - a + 1 >= MIN_SEG_FRAMES]
 
 
 def first_motion(rows):

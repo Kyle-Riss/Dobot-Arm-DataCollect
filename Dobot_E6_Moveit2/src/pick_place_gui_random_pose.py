@@ -25,11 +25,13 @@ _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _WORKSPACE_ROOT = os.path.dirname(os.path.dirname(_CURRENT_DIR))
 VLA_DATASET_RANDOM_POSE = os.path.join(_WORKSPACE_ROOT, "vla_dataset_random_pose")
 
-# 초기 대기 자세용 고정 RPY (Teach pendant 기준, 수직에 가까운 자세)
-# Pick/Place 이동 시에는 base의 섹션별 RPY가 그대로 적용된다.
-INIT_SAFE_RX = -179.5275
-INIT_SAFE_RY = -2.4369
-INIT_SAFE_RZ = 2.3663
+# 초기 대기 자세용 고정 RPY — Travel RPY와 동일하게 설정.
+# 이전값(-179.5275)은 Travel RX(+176.5°)와 ±180° 경계를 사이에 두고 반대편에 위치해,
+# INIT → 이동 전환 시 관절이 ~356° 회전하며 충돌 알람을 유발했다.
+# TRAVEL_RX와 일치시키면 RPY 변화가 0°이므로 경계 통과가 사라진다.
+INIT_SAFE_RX = base.TRAVEL_RX   # 176.4624 (was -179.5275)
+INIT_SAFE_RY = base.TRAVEL_RY   # -1.7726  (was -2.4369)
+INIT_SAFE_RZ = base.TRAVEL_RZ   # 8.1319   (was 2.3663)
 
 
 def generate_random_initial_pose():
@@ -45,7 +47,7 @@ def generate_random_initial_pose():
     else:
         x, y = base.generate_random_point_in_section(base.B_SECTION_POINTS)
 
-    z = random.uniform(150.0, getattr(base, "Z_MOVE_MAX", 300.0))
+    z = random.uniform(200.0, getattr(base, "Z_MOVE_MAX", 300.0))
 
     return x, y, z, INIT_SAFE_RX, INIT_SAFE_RY, INIT_SAFE_RZ
 
@@ -127,8 +129,9 @@ class PickPlaceGUIRandomPose(base.PickPlaceGUINew):
         except Exception:
             pass
 
-    # 랜덤 INIT 첫 MovJ 실패 시 시도할 고정 대기(홈) 포즈 (x,y,z,rx,ry,rz)
-    _FIXED_INIT = (89.3715, -102.9836, 611.7122, 90.1244, 3.6761, 5.7400)
+    # 랜덤 INIT 첫 MovJ 실패 시 시도할 고정 대기 포즈 (x,y,z,rx,ry,rz)
+    # Z=150~300mm 범위로 유지 (랜덤포즈와 동일 조건)
+    _FIXED_INIT = (89.3715, -378.5400, 250.0000, INIT_SAFE_RX, INIT_SAFE_RY, INIT_SAFE_RZ)
 
     def _reset_init_to_fixed(self):
         """레거시 호환: 랜덤 INIT 사용으로 통일 (고정 초기화 제거)."""

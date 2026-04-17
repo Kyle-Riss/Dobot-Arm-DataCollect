@@ -304,6 +304,11 @@ class DobotApiDashboard(DobotApi):
         string = "ClearError()"
         return self.sendRecvMsg(string)
 
+    def ResumeRobot(self):
+        """Resume robot from PAUSE state."""
+        string = "ResumeRobot()"
+        return self.sendRecvMsg(string)
+
     def PowerOn(self):
         """
         Powering on the robot

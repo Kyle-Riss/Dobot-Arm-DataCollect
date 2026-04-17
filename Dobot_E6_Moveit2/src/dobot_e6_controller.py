@@ -121,6 +121,15 @@ class DobotE6Controller:
             result = self.dashboard.DisableRobot()
             print(f"Disable robot: {result}")
     
+    def resume_robot(self):
+        """PAUSE(RobotMode=10) 상태 해제. 에러 없이 일시 정지된 경우에 사용."""
+        if self.dashboard:
+            try:
+                result = self.dashboard.ResumeRobot()
+                print(f"[resume_robot] {result}")
+            except Exception as e:
+                print(f"[resume_robot] failed: {e}")
+
     def clear_error(self):
         """Clear robot errors"""
         if self.dashboard:
@@ -270,7 +279,8 @@ class DobotE6Controller:
             print("✗ Dashboard not connected")
             return False
         
-        # 이동 시도 전 에러 클리어 + 로봇 활성화(가능한 범위인데 안 움직일 때 대비)
+        # 이동 전 상태 복구: PAUSE(10) → resume, ERROR(9) → clear+enable
+        self.resume_robot()
         self.clear_error()
         self.enable_robot(sleep_after=0.1)
         
@@ -319,146 +329,37 @@ class DobotE6Controller:
             print(f"     Please switch the robot to TCP mode using the controller")
             return False
         
-        # Check for error code in format "0,{error_code},..." (e.g., "0,{8047},MovJ(...)")
-        # Also handle empty error code: "0,{},Command(...)" or "0,{[]},Command(...)" which means success
-        # Pattern: {숫자} 또는 {} 또는 {[]}
-        error_match = re.search(r'\{([^\}]*)\}', result_str)
-        if error_match:
-            error_code_str = error_match.group(1).strip()
-            
-            # Empty / 0 / [] = 성공 ("0,{},MovJ" 또는 "0,{0},MovJ" 등)
-            # 컨트롤러가 수락했으면 성공으로 처리
-            if error_code_str.strip() == "" or error_code_str == "[]" or error_code_str.strip() == "0":
-                self.last_move_response = ""
-                if coordinate_mode == 0:
-                    print(f"MovJ → Pose ({x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f}) [accepted]")
-                else:
-                    print(f"MovJ → Joint ({x:.1f}°, {y:.1f}°, {z:.1f}°, {rx:.1f}°, {ry:.1f}°, {rz:.1f}°) [accepted]")
-                return True
-            
-            # Try to parse as integer error code
-            try:
-                error_code = int(error_code_str)
-                if error_code != 0:
-                    print(f"✗ Movement failed with error code: {error_code}")
-                    print(f"  Response: {result_str}")
-                    print(f"  Target: ({x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f})")
-                    
-                    # Common error codes:
-                    # 8047: IK solution not found (Algorithm error)
-                    # 8048: Collision detection
-                    if error_code == 8047 or error_code == 2:
-                        print("  Error: Inverse kinematics solution not found (Algorithm error)")
-                        if radius is not None:
-                            print(f"  Problem: Low Z ({z:.1f}mm) + Large radius ({radius:.1f}mm) combination")
-                        else:
-                            print(f"  Problem: IK solution not found for target position")
-                        self.clear_error()
-                        
-                        # Try with simple waypoint strategy if enabled (minimal Z adjustment)
-                        if use_waypoint and coordinate_mode == 0:
-                            print("  Attempting simple waypoint strategy...")
-                            current_pose = self.get_current_pose_from_feedback()
-                            if current_pose:
-                                # Simple strategy: small intermediate waypoint (minimal Z change)
-                                # Only add 20-30mm to Z if current Z is very low
-                                if z < 50:
-                                    waypoint_z = z + 30  # Only add 30mm for very low Z
-                                else:
-                                    waypoint_z = max(current_pose[2], z) + 20  # Small increment
-                                
-                                # Try intermediate waypoint at same XY, slightly higher Z
-                                waypoint1_result = self.dashboard.MovJ(
-                                    x, y, waypoint_z, rx, ry, rz, 0, v=int(velocity)
-                                )
-                                
-                                # Check waypoint result
-                                waypoint1_success = False
-                                if waypoint1_result is None or waypoint1_result == "":
-                                    waypoint1_success = True
-                                else:
-                                    waypoint1_str = str(waypoint1_result).strip()
-                                    waypoint_error_match = re.search(r'\{([^\}]*)\}', waypoint1_str)
-                                    if waypoint_error_match:
-                                        waypoint_error_code_str = waypoint_error_match.group(1).strip()
-                                        if waypoint_error_code_str == "" or waypoint_error_code_str == "[]":
-                                            waypoint1_success = True
-                                        else:
-                                            try:
-                                                waypoint_error_code = int(waypoint_error_code_str)
-                                                if waypoint_error_code == 0:
-                                                    waypoint1_success = True
-                                            except ValueError:
-                                                pass
-                                    elif not waypoint1_str.startswith("-"):
-                                        waypoint1_success = True
-                                
-                                if waypoint1_success:
-                                    self.wait_for_motion_complete()
-                                    print(f"  ✓ Reached intermediate Z ({waypoint_z:.1f}mm)")
-                                    
-                                    # Now try target Z
-                                    final_result = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0, v=int(velocity))
-                                    
-                                    # Check final result
-                                    final_success = False
-                                    if final_result is None or final_result == "":
-                                        final_success = True
-                                    else:
-                                        final_str = str(final_result).strip()
-                                        final_error_match = re.search(r'\{([^\}]*)\}', final_str)
-                                        if final_error_match:
-                                            final_error_code_str = final_error_match.group(1).strip()
-                                            if final_error_code_str == "" or final_error_code_str == "[]":
-                                                final_success = True
-                                            else:
-                                                try:
-                                                    final_error_code = int(final_error_code_str)
-                                                    if final_error_code == 0:
-                                                        final_success = True
-                                                except ValueError:
-                                                    pass
-                                        elif not final_str.startswith("-"):
-                                            final_success = True
-                                    
-                                    if final_success:
-                                        print(f"✓ Reached target via waypoint")
-                                        return True
-                        
-                        print("  Solution:")
-                        print("    1. Check if position is actually reachable")
-                        print("    2. Move robot to a different position first")
-                        print("    3. Try adjusting orientation angles (especially Rx)")
-                        print("    4. Try increasing Z height slightly")
-                        print("    5. Use joint mode for manual control")
-                        return False
-                elif error_code == 8048 or error_code == 1:
-                    print("  ⚠️  Error: Robot collision or joint limit exceeded")
-                    print("  ⚠️  COLLISION DETECTED - Robot movement stopped for safety")
-                    self.clear_error()
-                    print("  Solution:")
-                    print("    1. Check robot position - may be in collision state")
-                    print("    2. Manually move robot to safe position")
-                    print("    3. Verify target position is reachable")
-                    print("    4. Check joint limits and workspace boundaries")
-                    return False
-                elif 100 <= error_code <= 299:
-                    # 경고 코드: 컨트롤러가 명령 수락 후 동작하는 경우 (예: 182, 183, 184...) — 성공으로 처리
-                    if coordinate_mode == 0:
-                        print(f"MovJ → Pose ({x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f}) [accepted, warning {error_code}]")
-                    else:
-                        print(f"MovJ → Joint ({x:.1f}°, {y:.1f}°, {z:.1f}°, {rx:.1f}°, {ry:.1f}°, {rz:.1f}°) [accepted, warning {error_code}]")
-                    return True
-                else:
-                    print(f"  Unknown error code: {error_code}")
-                    self.clear_error()
-                    return False
-            except ValueError:
-                # Not a numeric error code, might be array or other format
-                # If it's not empty and not a number, log it but don't fail
-                if error_code_str and error_code_str != "[]":
-                    print(f"[WARNING] Unexpected error code format: '{error_code_str}' in response: {result_str}")
-                # Continue to check other formats
+        # 응답 형식: "ErrorID,{QueuedCmdID},CommandName(...)"
+        # ErrorID = 0 → 성공 / 비영 → 실패
+        # {QueuedCmdID} 는 커맨드 순번(1,2,3...)이며 에러 코드가 아님
+        first_field = result_str.split(',')[0].strip()
+        try:
+            error_id = int(first_field)
+        except ValueError:
+            error_id = -1  # 파싱 불가 → 아래 unknown 처리로 넘어감
+
+        if error_id == 0:
+            self.last_move_response = ""
+            if coordinate_mode == 0:
+                print(f"MovJ → Pose ({x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f})")
+            else:
+                print(f"MovJ → Joint ({x:.1f}°, {y:.1f}°, {z:.1f}°, {rx:.1f}°, {ry:.1f}°, {rz:.1f}°)")
+            return True
+
+        # error_id > 0 또는 파싱 불가(-1): 실제 에러
+        if error_id > 0:
+            print(f"✗ Movement failed with error ID: {error_id}")
+            print(f"  Response: {result_str}")
+            print(f"  Target: ({x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f})")
+            if error_id in (8047, 2):
+                print("  Error: IK solution not found")
+                self.clear_error()
+            elif error_id in (8048, 1):
+                print("  Error: Collision or joint limit")
+                self.clear_error()
+            else:
+                self.clear_error()
+            return False
         
         if result_str.startswith("-") or "error" in result_str.lower():
             # Parse error code
@@ -860,34 +761,47 @@ class DobotE6Controller:
     
     def wait_for_motion_complete(self, timeout: float = 30.0) -> bool:
         """
-        Wait for robot motion to complete
-        
-        Args:
-            timeout: Maximum wait time in seconds
-            
-        Returns:
-            True if motion completed, False if timeout
+        Wait for robot motion to complete.
+
+        두 단계 확인:
+          1) RunningStatus != 0 (실행 중) 을 한 번이라도 확인
+          2) 그 후 RunningStatus == 0 (완료) 를 확인
+        MovJ 명령이 큐에만 올라간 상태(아직 실행 전) 에서 RunningStatus 가 일시적으로 0 인
+        경우를 오판하지 않기 위해, 300 ms 동안 계속 0 이면 즉시 완료로 처리한다.
         """
         if not self.feed:
             print("✗ Feedback not connected")
             return False
-            
+
         start_time = time.time()
-        
+        seen_running = False
+        idle_start = None
+
         while time.time() - start_time < timeout:
             try:
                 data = self.feed.feedBackData()
                 if data is not None and len(data) > 0:
-                    # RunningStatus: 0 = idle/ready, 1 = running
-                    running_status = data['RunningStatus'][0]
-                    if running_status == 0:
-                        print("✓ Motion complete")
-                        return True
-            except Exception as e:
+                    status = int(data['RunningStatus'][0])
+                    if status != 0:
+                        # 로봇이 실제로 움직이기 시작함
+                        seen_running = True
+                        idle_start = None
+                    else:
+                        if seen_running:
+                            # 움직임 시작 후 완료됨 → 정상 완료
+                            print("✓ Motion complete")
+                            return True
+                        # 아직 움직임을 감지 못 한 idle 구간 추적
+                        if idle_start is None:
+                            idle_start = time.time()
+                        elif time.time() - idle_start >= 0.3:
+                            # 300 ms 째 idle → 매우 짧은 이동이거나 이미 목표 위치
+                            print("✓ Motion complete")
+                            return True
+            except Exception:
                 pass
-            
-            time.sleep(0.1)
-        
+            time.sleep(0.05)
+
         print("✗ Motion timeout")
         return False
     

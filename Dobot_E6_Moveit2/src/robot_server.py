@@ -113,8 +113,9 @@ from pick_place_gui_random_pose import (
 )
 
 # 데이터 저장 경로 — 외장 드라이브 마운트 확인 필요
-DATA_SAVE_DIR   = "/media/billye6/새 볼륨/Dobot/2CAM"
-DATA_DRIVE_ROOT = "/media/billye6/새 볼륨"   # 마운트 여부 판단 기준
+DATA_SAVE_DIR      = "/media/billye6/새 볼륨/Dobot/2CAM-Orange"
+DATA_SAVE_DIR_V10  = "/media/billye6/새 볼륨/Dobot/2CAM-Orange-init"   # v10 고정홈 수집 전용
+DATA_DRIVE_ROOT    = "/media/billye6/새 볼륨"   # 마운트 여부 판단 기준
 from dobot_e6_controller import DobotE6Controller
 from suction_gripper import SuctionGripper
 
@@ -210,9 +211,20 @@ _state = {
     "pick_section":   "A",
     "last_place_x":   None,
     "last_place_y":   None,
+    "collect_mode":   "auto",   # "auto" = 기존 랜덤포즈 | "v10" = 고정 홈포지션 신규수집
+    # v20+ 앵커 페어 선택
+    "anchor_a_idx":       None,   # None=random, 0/1/2 = A3/A4/A5 고정
+    "anchor_b_idx":       None,   # None=random, 0/1/2 = B1/B2/B3 고정
+    "force_pick_section": None,   # None=auto-alternate, "A"/"B" = 방향 고정
+    "pair_counts":        {},     # "AB_a_b" / "BA_b_a" → 성공 에피소드 수
 }
 
+# v10 수집 모드 고정 홈포지션 (joint angles, degrees)
+V10_JOINT_HOME = [91.3, 37.7, 53.8, -1.5, -87.8, 173.3]
+
 _state_lock  = threading.Lock()
+_ORIG_A_ANCHORS: list = []   # base.A_ANCHORS 원본 (startup 시 캡처)
+_ORIG_B_ANCHORS: list = []
 _ws_clients: Set[WebSocket] = set()
 _log_queue: asyncio.Queue   = None
 _main_loop: asyncio.AbstractEventLoop = None
@@ -275,9 +287,46 @@ def _set_random_init_pose(robot):
 def _get_next_folder(base_dir: str) -> int:
     if not os.path.exists(base_dir):
         return 1
-    nums = [int(d) for d in os.listdir(base_dir)
-            if os.path.isdir(os.path.join(base_dir, d)) and d.isdigit()]
-    return max(nums, default=0) + 1
+    nums = set(int(d) for d in os.listdir(base_dir)
+               if os.path.isdir(os.path.join(base_dir, d)) and d.isdigit())
+    n = 1
+    while n in nums:
+        n += 1
+    return n
+
+# ── 앵커 페어 카운팅 헬퍼 ──────────────────────────────────────────────────
+_A_ANCHOR_REF = [(217.75, -405.65), (220.21, -368.72), (221.63, -318.39)]
+_B_ANCHOR_REF = [(30.0, -340.0),   (30.0, -377.0),    (30.0, -415.0)]
+
+def _anchor_to_idx(anchor, ref):
+    if not anchor or not isinstance(anchor, (list, tuple)):
+        return None
+    for i, (ax, ay) in enumerate(ref):
+        if abs(anchor[0] - ax) < 1.0 and abs(anchor[1] - ay) < 1.0:
+            return i
+    return None
+
+def _update_pair_count(meta):
+    pick_section = meta.get("pick_section")
+    pick_anchor  = meta.get("pick_anchor")
+    place_anchor = meta.get("place_anchor")
+    if not pick_section or pick_anchor is None or place_anchor is None:
+        return
+    if pick_section == "A":
+        a_idx = _anchor_to_idx(pick_anchor,  _A_ANCHOR_REF)
+        b_idx = _anchor_to_idx(place_anchor, _B_ANCHOR_REF)
+        if a_idx is None or b_idx is None:
+            return
+        key = f"AB_{a_idx}_{b_idx}"
+    else:
+        b_idx = _anchor_to_idx(pick_anchor,  _B_ANCHOR_REF)
+        a_idx = _anchor_to_idx(place_anchor, _A_ANCHOR_REF)
+        if b_idx is None or a_idx is None:
+            return
+        key = f"BA_{b_idx}_{a_idx}"
+    with _state_lock:
+        counts = _state.setdefault("pair_counts", {})
+        counts[key] = counts.get(key, 0) + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 카메라 그랩 루프 (MJPEG 버퍼 + 레코딩 numpy 버퍼 동시 갱신)
@@ -374,8 +423,9 @@ def _start_recording():
         return
     # ────────────────────────────────────────────────────────────────────────
 
-    n = _get_next_folder(DATA_SAVE_DIR)
-    save_dir = os.path.join(DATA_SAVE_DIR, str(n))
+    base = DATA_SAVE_DIR_V10 if _state.get("collect_mode") == "v10" else DATA_SAVE_DIR
+    n = _get_next_folder(base)
+    save_dir = os.path.join(base, str(n))
     has_zed = bool(_state["camera_zed"] and _state["camera_zed"].initialized)
     try:
         os.makedirs(os.path.join(save_dir, "images", "hik"), exist_ok=True)
@@ -392,18 +442,14 @@ def _start_recording():
 
     _state.update(recording=True, recorded_data=[], record_save_dir=save_dir,
                   record_frame_count=0)
-    mode_str = "ROS2+sync" if (_ros2_ok and has_zed) else "legacy"
+    mode_str = "20Hz+ROS2pub" if _ros2_ok else "20Hz-legacy"
     _log(f"Recording started → {save_dir} (ZED={'ON' if has_zed else 'OFF'}, mode={mode_str})")
-    if _ros2_ok:
-        _ros2.start_recording(save_dir)
+    # ROS2 는 퍼블리시 전용 — start_recording 호출 안 함 (_on_sync 가 디스크 쓰지 않도록)
     threading.Thread(target=_record_loop, daemon=True).start()
 
 def _record_loop():
     while _state["recording"]:
-        # ros2 + ZED 동시 활성 시: sync callback 이 저장 처리 → legacy tick 건너뜀
-        has_zed_now = bool(_state["camera_zed"] and _state["camera_zed"].initialized)
-        if not (_ros2_ok and has_zed_now):
-            _record_tick()
+        _record_tick()
         time.sleep(0.05)
 
 def _record_tick():
@@ -469,19 +515,11 @@ def _stop_and_save(success: bool):
     time.sleep(0.07)
     save_dir = _state["record_save_dir"]
 
-    # ros2 sync 데이터 우선 사용, 없으면 legacy fallback
-    if _ros2_ok:
-        ros2_data = _ros2.stop_recording()
-        data = ros2_data if ros2_data else _state["recorded_data"]
-    else:
-        data = _state["recorded_data"]
+    # ROS2 는 토픽 퍼블리시 전용 — 저장 데이터는 항상 legacy _record_tick 기준
+    data = _state["recorded_data"]
 
     if not success:
-        _log("Episode failed → not saved")
-        if save_dir and os.path.isdir(save_dir):
-            shutil.rmtree(save_dir, ignore_errors=True)
-        _state.update(recorded_data=[], record_save_dir=None)
-        return
+        _log("Episode failed → saving as failed episode (no discard)")
 
     if not save_dir or not data:
         _log(f"No data recorded (dir={save_dir}, n={len(data) if data else 0})")
@@ -535,7 +573,7 @@ def _stop_and_save(success: bool):
                     closest_fid = min(ts_list, key=lambda t: abs(t[1] - ev_ts))[0]
                     f.write(f"{ev_name},{closest_fid},{ev_ts:.6f}\n")
         # metadata.txt (호환성 유지)
-        with open(os.path.join(save_dir, "metadata.txt"), 'w') as f:
+        with open(os.path.join(save_dir, "metadata.txt"), 'w', encoding='utf-8') as f:
             f.write("VLA Dataset - Pick-Place Step\n" + "="*50 + "\n\n")
             f.write(f"Folder: {folder_num}\n")
             f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -545,6 +583,9 @@ def _stop_and_save(success: bool):
             f.write(f"Step Success: {success}\n")
             f.write(f"VacuumCommandPickDuration_s: {_state['vacuum_pick']:.3f}\n")
             f.write(f"VacuumCommandPlaceDuration_s: {_state['vacuum_place']:.3f}\n")
+            f.write(f"Prompt: {ep_meta.get('prompt', '')}\n")
+            f.write(f"Object: {ep_meta.get('object_label', '')} | Marker: {ep_meta.get('object_marker', '')}\n")
+            f.write(f"Workspace: {ep_meta.get('workspace', '')} | {ep_meta.get('source_zone', '')} → {ep_meta.get('target_zone', '')}\n")
         _state["episode_meta"] = {}
         _log(f"Saved {len(data)} frames → {save_dir}")
     except Exception as e:
@@ -562,19 +603,45 @@ def _on_rec_begin():  _start_recording()
 def _on_episode_meta(meta): _state["episode_meta"] = meta
 
 def _on_finished(success: bool):
+    w = _state.get("worker")
+    manual_stop = bool(w and getattr(w, "_stop_requested", False))
+    _qc_data = list(_state.get("recorded_data") or [])
+    _qc_dir  = _state.get("record_save_dir") or ""
+
+    # 앵커 카운팅을 위해 episode_meta를 _stop_and_save 전에 캡처
+    ep_meta_snap = dict(_state.get("episode_meta") or {})
+
+    if manual_stop:
+        # 수동 STOP: 기록 중단 후 폴더 삭제
+        _state["recording"] = False
+        time.sleep(0.07)
+        _state.update(recorded_data=[], record_save_dir=None, episode_meta={})
+        if _qc_dir and os.path.isdir(_qc_dir):
+            shutil.rmtree(_qc_dir)
+            _log(f"STOP: 미완성 에피소드 삭제 → {_qc_dir}")
+        else:
+            _log("STOP: 저장 중인 데이터 없음")
+        _state.update(auto_target=0, auto_done=0)
+        _log("⚠ 자동 수집 중단됨 (수동 STOP)")
+        return
+
     _stop_and_save(success)
-    w = _state["worker"]
+    if success:
+        _update_pair_count(ep_meta_snap)
+    if _state.get("collect_mode") == "v10" and success:
+        success = _check_episode_quality_v10(_qc_data, _qc_dir)
     if w and hasattr(w, 'place_x') and w.place_x is not None:
         _state["last_place_x"] = w.place_x
         _state["last_place_y"] = w.place_y
-        _state["pick_section"] = "B" if _state["pick_section"] == "A" else "A"
+        # 방향 고정 모드에서는 자동 교번하지 않음
+        if not _state.get("force_pick_section"):
+            _state["pick_section"] = "B" if _state["pick_section"] == "A" else "A"
         _log(f"Place ({w.place_x:.1f},{w.place_y:.1f}) / next: {_state['pick_section']}")
 
     if _state["auto_target"] > 0:
         if not success:
-            # STOP 또는 실패 → 자동 수집 중단, 카운트 증가 없음
-            _state.update(auto_target=0, auto_done=0)
-            _log("⚠ 자동 수집 중단됨 (실패/STOP)")
+            _log("⚠ 실패/폐기 에피소드 발생 — 다음 에피소드 자동 진행")
+            threading.Timer(0.3, _run_step).start()
             return
         _state["auto_done"] += 1
         _log(f"Auto {_state['auto_done']}/{_state['auto_target']}")
@@ -586,6 +653,90 @@ def _on_finished(success: bool):
     else:
         _log("Step complete")
 
+DJ3_DISCARD_THRESHOLD = 0.4  # |dj3_mean|이 이 값 미만이면 느린 접근
+DJ3_SIGN_EPS = 0.05          # 부호 판정 시 노이즈 무시 임계값
+
+def _check_episode_quality_v10(data=None, save_dir=None) -> bool:
+    """v10 수집 후 approach 품질 체크.
+
+    경고 조건 (OR):
+      - j3_dip : approach 중 dj3 방향 반전(부호 전환) 발생
+      - dj3_low: approach |dj3_mean| < 0.4°/f
+
+    Returns:
+        True  — 에피소드 유지 (폐기하지 않고 경고만 기록)
+    """
+    if data is None:
+        data = _state.get("recorded_data") or []
+    if not save_dir:
+        save_dir = _state.get("record_save_dir") or ""
+    ep_num = os.path.basename(save_dir) if save_dir else "?"
+
+    if len(data) < 10:
+        return True
+
+    # mode=9 (IK 에러) 프레임 → 데이터 오염 → 즉시 폐기
+    mode9_count = sum(1 for r in data if r.get("robot_mode") == 9)
+    if mode9_count > 0:
+        _log(f"⚠ [ep{ep_num}] mode=9 {mode9_count}프레임 감지 — 폐기하지 않고 유지")
+        return True
+
+    # approach: 첫 mode=7 시작 ~ gripper_on 프레임 (전체 pick 접근 구간)
+    ap_start = next((i for i, r in enumerate(data) if r.get("robot_mode") == 7), None)
+    if ap_start is None:
+        return True
+    grip_frame = next(
+        (i for i in range(ap_start, len(data)) if data[i].get("gripper_tooldo1") == 1),
+        None,
+    )
+    if grip_frame is not None:
+        j3_vals = [float(data[i]["joint_angles"][2]) for i in range(ap_start, grip_frame + 1)
+                   if "joint_angles" in data[i]]
+    else:
+        # fallback: 첫 mode=7 블록만
+        j3_vals = []
+        in_ap = False
+        for r in data:
+            m = r.get("robot_mode")
+            if not in_ap and m == 7:
+                in_ap = True
+            if in_ap:
+                if m == 7 and "joint_angles" in r:
+                    j3_vals.append(float(r["joint_angles"][2]))
+                else:
+                    break
+    if len(j3_vals) < 5:
+        return True
+
+    dj3_list = [j3_vals[i+1] - j3_vals[i] for i in range(len(j3_vals)-1)]
+    dj3_mean = sum(dj3_list) / len(dj3_list) if dj3_list else 0.0
+    dj3_low = abs(dj3_mean) < DJ3_DISCARD_THRESHOLD
+
+    # 방향 반전(진동) 체크: 노이즈 구간은 제외하고 부호 전환 횟수 계산
+    nonzero_signs = []
+    for d in dj3_list:
+        if d > DJ3_SIGN_EPS:
+            nonzero_signs.append(1)
+        elif d < -DJ3_SIGN_EPS:
+            nonzero_signs.append(-1)
+    sign_flip_count = sum(
+        1 for i in range(1, len(nonzero_signs))
+        if nonzero_signs[i] != nonzero_signs[i - 1]
+    )
+    j3_dip = sign_flip_count > 0
+
+    if j3_dip or dj3_low:
+        reason = []
+        if j3_dip:
+            reason.append(f"j3 방향반전 {sign_flip_count}회")
+        if dj3_low:
+            reason.append(f"|dj3|={abs(dj3_mean):.3f}<{DJ3_DISCARD_THRESHOLD}")
+        _log(f"⚠ [ep{ep_num}] 품질 경고: {', '.join(reason)} — 폐기하지 않고 유지")
+        return True
+    else:
+        _log(f"✓ [ep{ep_num}] approach dj3_mean={dj3_mean:+.3f}°/f — 통과")
+        return True
+
 def _run_step():
     robot   = _state["robot"]
     gripper = _state["gripper"]
@@ -594,16 +745,53 @@ def _run_step():
     if _state["worker"] and _state["worker"].isRunning():
         _log("Worker already running"); return
 
-    _set_random_init_pose(robot)
+    # ── 방향/앵커 오버라이드 적용 ────────────────────────────────────────────
+    forced_dir = _state.get("force_pick_section")
+    if forced_dir in ("A", "B"):
+        _state["pick_section"] = forced_dir
+
+    if _ORIG_A_ANCHORS:
+        a_idx = _state.get("anchor_a_idx")
+        b_idx = _state.get("anchor_b_idx")
+        base.A_ANCHORS = [_ORIG_A_ANCHORS[a_idx]] if (a_idx is not None and 0 <= a_idx < 3) else list(_ORIG_A_ANCHORS)
+        base.B_ANCHORS = [_ORIG_B_ANCHORS[b_idx]] if (b_idx is not None and 0 <= b_idx < 3) else list(_ORIG_B_ANCHORS)
+    # ────────────────────────────────────────────────────────────────────────
+
+    mode = _state.get("collect_mode", "auto")
+
+    if mode == "v10":
+        # v10: joint-space 고정 홈포지션으로 이동 후 수집
+        j = V10_JOINT_HOME
+        _log(f"[v10] 홈포지션 이동 → j3={j[2]}° j4={j[3]}°")
+        ok = robot.move_j(j[0], j[1], j[2], j[3], j[4], j[5],
+                          velocity=25, coordinate_mode=1, use_waypoint=False)
+        if not ok:
+            _log("⚠ [v10] 홈포지션 이동 실패 — 수집 중단"); return
+        robot.wait_for_motion_complete()
+        # 실제 도달한 TCP 좌표를 INIT으로 설정 → step1이 no-op, IK 경유점 오염 방지
+        pose = robot.get_current_pose_from_feedback()
+        if pose and len(pose) >= 6:
+            base.INIT_X, base.INIT_Y, base.INIT_Z   = pose[0], pose[1], pose[2]
+            base.INIT_RX, base.INIT_RY, base.INIT_RZ = pose[3], pose[4], pose[5]
+            _log(f"[v10] INIT TCP 갱신: X={pose[0]:.1f} Y={pose[1]:.1f} Z={pose[2]:.1f}")
+        else:
+            base.INIT_X = FIXED_INIT[0]; base.INIT_Y = FIXED_INIT[1]; base.INIT_Z = FIXED_INIT[2]
+            base.INIT_RX = FIXED_INIT[3]; base.INIT_RY = FIXED_INIT[4]; base.INIT_RZ = FIXED_INIT[5]
+            _log("⚠ [v10] TCP 피드백 실패 — FIXED_INIT 사용")
+    else:
+        _set_random_init_pose(robot)
+
     cam_hik = _state["camera_hik"] if (_state["camera_hik"] and
                                         _state["camera_hik"].initialized) else None
+    vel_scale = 2.0 if mode == "v10" else 1.0
     worker = RandomPosePickPlaceStepWorker(
         robot, gripper,
-        pick_section = _state["pick_section"],
-        pick_x       = _state["last_place_x"],
-        pick_y       = _state["last_place_y"],
-        camera       = cam_hik,
+        pick_section   = _state["pick_section"],
+        pick_x         = _state["last_place_x"],
+        pick_y         = _state["last_place_y"],
+        camera         = cam_hik,
         fallback_initial_pose = FIXED_INIT,
+        velocity_scale = vel_scale,
     )
     worker.log_signal.connect(_on_log)
     worker.finished.connect(_on_finished)
@@ -620,10 +808,16 @@ app = FastAPI(title="Dobot E6 Server")
 
 @app.on_event("startup")
 async def _startup():
-    global _log_queue, _main_loop, _ros2_ok, _robot_pub_running
+    global _log_queue, _main_loop, _ros2_ok, _robot_pub_running, _ORIG_A_ANCHORS, _ORIG_B_ANCHORS
     _log_queue = asyncio.Queue()
     _main_loop = asyncio.get_event_loop()
     asyncio.create_task(_broadcast())
+
+    # v20+ 앵커 오버라이드용 원본 리스트 캡처
+    if hasattr(base, 'A_ANCHORS') and hasattr(base, 'B_ANCHORS'):
+        _ORIG_A_ANCHORS = list(base.A_ANCHORS)
+        _ORIG_B_ANCHORS = list(base.B_ANCHORS)
+        _log(f"Anchor refs captured: A={_ORIG_A_ANCHORS} B={_ORIG_B_ANCHORS}")
 
     # ROS2 레코더 초기화 (rclpy 미설치 시 False 반환 → fallback 모드)
     _ros2_ok = _ros2.start()
@@ -756,6 +950,40 @@ def status():
         "auto_target":    _state["auto_target"],
         "auto_done":      _state["auto_done"],
         "worker_running": bool(_state["worker"] and _state["worker"].isRunning()),
+        "collect_mode":   _state.get("collect_mode", "auto"),
+    }
+
+@app.post("/collect-mode")
+def set_collect_mode(mode: str):
+    if mode not in ("auto", "v10"):
+        return JSONResponse({"ok": False, "msg": "mode must be 'auto' or 'v10'"}, status_code=400)
+    _state["collect_mode"] = mode
+    label = "기존 랜덤포즈" if mode == "auto" else "v10 고정홈포지션"
+    _log(f"수집 모드 변경: {mode} ({label})")
+    return {"ok": True, "msg": f"모드: {label}"}
+
+@app.post("/anchor")
+def set_anchor(direction: str = "auto", a_idx: int = -1, b_idx: int = -1):
+    if direction not in ("A", "B", "auto"):
+        return JSONResponse({"ok": False, "msg": "direction must be A, B, or auto"}, status_code=400)
+    _state["force_pick_section"] = None if direction == "auto" else direction
+    _state["anchor_a_idx"] = None if a_idx < 0 else a_idx
+    _state["anchor_b_idx"] = None if b_idx < 0 else b_idx
+    A_LABELS = ["A3", "A4", "A5"]
+    B_LABELS = ["B1", "B2", "B3"]
+    a_str = A_LABELS[a_idx] if 0 <= a_idx < 3 else "랜덤"
+    b_str = B_LABELS[b_idx] if 0 <= b_idx < 3 else "랜덤"
+    _log(f"앵커 설정: 방향={direction} | A={a_str} | B={b_str}")
+    return {"ok": True}
+
+@app.get("/anchor-status")
+def anchor_status():
+    return {
+        "force_pick_section": _state.get("force_pick_section"),
+        "anchor_a_idx":       _state.get("anchor_a_idx"),
+        "anchor_b_idx":       _state.get("anchor_b_idx"),
+        "pick_section":       _state.get("pick_section"),
+        "pair_counts":        _state.get("pair_counts", {}),
     }
 
 # ─── 로봇 제어 ────────────────────────────────────────────────────────────
@@ -1110,6 +1338,12 @@ input[type=range]{width:100%;accent-color:#00c8e8}
 
 /* pose capture */
 #pose-display{font-size:.68rem;color:#9cf;margin-top:4px;font-family:monospace;word-break:break-all;min-height:16px}
+
+/* anchor pair table cells */
+.pc{text-align:center;padding:2px 4px;background:#0d1a2e;border-radius:3px;font-family:monospace;color:#9cf}
+.pc.has-data{color:#2dc653;font-weight:700}
+/* anchor selector button active */
+.anc-active{background:#0d3a2e !important;border-color:#00c8a0 !important;color:#00c8a0 !important}
 </style>
 </head>
 <body>
@@ -1164,6 +1398,106 @@ input[type=range]{width:100%;accent-color:#00c8e8}
   <!-- Data Collection -->
   <div class="card">
     <h3>Data Collection</h3>
+
+    <!-- 수집 모드 선택 -->
+    <div class="sub">수집 모드</div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="mode-btn-auto" class="btn-g" style="flex:1;padding:7px;font-size:.8rem"
+        onclick="setCollectMode('auto')">① 기존 (랜덤포즈)</button>
+      <button id="mode-btn-v10" style="flex:1;padding:7px;font-size:.8rem;border-color:#a78bfa;color:#a78bfa"
+        onclick="setCollectMode('v10')">② 신규 v10 (고정홈)</button>
+    </div>
+    <div id="mode-display" class="sbar" style="margin-bottom:8px;font-size:.72rem">모드: —</div>
+
+    <div class="sep"></div>
+    <!-- ── 앵커 페어 선택 (v20+) ── -->
+    <div class="sub">앵커 페어 선택 (v20+)</div>
+
+    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">방향 고정</div>
+    <div class="row" style="margin-bottom:5px">
+      <button id="dir-A"    onclick="anchorSetDir('A')"    style="flex:1;padding:5px;font-size:.74rem">A→B</button>
+      <button id="dir-B"    onclick="anchorSetDir('B')"    style="flex:1;padding:5px;font-size:.74rem">B→A</button>
+      <button id="dir-auto" onclick="anchorSetDir('auto')" style="flex:1;padding:5px;font-size:.74rem">Auto</button>
+    </div>
+
+    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">A앵커 (A3/A4/A5)</div>
+    <div class="row" style="margin-bottom:5px">
+      <button id="aa-rand" onclick="anchorSetA(-1)" style="flex:1;padding:4px;font-size:.72rem">랜덤</button>
+      <button id="aa-0"    onclick="anchorSetA(0)"  style="flex:1;padding:4px;font-size:.72rem">A3</button>
+      <button id="aa-1"    onclick="anchorSetA(1)"  style="flex:1;padding:4px;font-size:.72rem">A4</button>
+      <button id="aa-2"    onclick="anchorSetA(2)"  style="flex:1;padding:4px;font-size:.72rem">A5</button>
+    </div>
+
+    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">B앵커 (B1/B2/B3)</div>
+    <div class="row" style="margin-bottom:5px">
+      <button id="ba-rand" onclick="anchorSetB(-1)" style="flex:1;padding:4px;font-size:.72rem">랜덤</button>
+      <button id="ba-0"    onclick="anchorSetB(0)"  style="flex:1;padding:4px;font-size:.72rem">B1</button>
+      <button id="ba-1"    onclick="anchorSetB(1)"  style="flex:1;padding:4px;font-size:.72rem">B2</button>
+      <button id="ba-2"    onclick="anchorSetB(2)"  style="flex:1;padding:4px;font-size:.72rem">B3</button>
+    </div>
+
+    <div id="anchor-display" class="sbar" style="margin-bottom:6px;font-size:.7rem">앵커: —</div>
+
+    <!-- A→B 진행 현황 -->
+    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:2px">A→B 진행 현황</div>
+    <table style="width:100%;border-collapse:collapse;font-size:.65rem;margin-bottom:5px">
+      <tr>
+        <td style="color:#557;padding:2px 3px;width:26px"></td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B1</td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B2</td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B3</td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A3</td>
+        <td><div id="pl-AB_0_0" class="pc">0</div></td>
+        <td><div id="pl-AB_0_1" class="pc">0</div></td>
+        <td><div id="pl-AB_0_2" class="pc">0</div></td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A4</td>
+        <td><div id="pl-AB_1_0" class="pc">0</div></td>
+        <td><div id="pl-AB_1_1" class="pc">0</div></td>
+        <td><div id="pl-AB_1_2" class="pc">0</div></td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A5</td>
+        <td><div id="pl-AB_2_0" class="pc">0</div></td>
+        <td><div id="pl-AB_2_1" class="pc">0</div></td>
+        <td><div id="pl-AB_2_2" class="pc">0</div></td>
+      </tr>
+    </table>
+
+    <!-- B→A 진행 현황 -->
+    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:2px">B→A 진행 현황</div>
+    <table style="width:100%;border-collapse:collapse;font-size:.65rem;margin-bottom:7px">
+      <tr>
+        <td style="color:#557;padding:2px 3px;width:26px"></td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A3</td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A4</td>
+        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A5</td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B1</td>
+        <td><div id="pl-BA_0_0" class="pc">0</div></td>
+        <td><div id="pl-BA_0_1" class="pc">0</div></td>
+        <td><div id="pl-BA_0_2" class="pc">0</div></td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B2</td>
+        <td><div id="pl-BA_1_0" class="pc">0</div></td>
+        <td><div id="pl-BA_1_1" class="pc">0</div></td>
+        <td><div id="pl-BA_1_2" class="pc">0</div></td>
+      </tr>
+      <tr>
+        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B3</td>
+        <td><div id="pl-BA_2_0" class="pc">0</div></td>
+        <td><div id="pl-BA_2_1" class="pc">0</div></td>
+        <td><div id="pl-BA_2_2" class="pc">0</div></td>
+      </tr>
+    </table>
+
+    <div class="sep"></div>
+
     <div id="auto-bar" class="sbar">Ready</div>
     <div class="row">
       <button class="btn-g" onclick="api('POST','/pick-place/step')">▶ Step</button>
@@ -1345,8 +1679,11 @@ setInterval(async () => {
   $('mode-bar').style.color      = isError ? '#ff4444' : '#dde';
   $('mode-bar').style.fontWeight = isError ? '700' : 'normal';
 
-  // ERROR 상태면 자동 수집 서버 측 중단 알림
-  if (isError && s.auto_target > 0) {
+  // ERROR 상태면 자동 수집 서버 측 중단 알림 (2회 연속 감지 시에만 — 순간적 error 무시)
+  if (!window._errCount) window._errCount = 0;
+  if (isError) { window._errCount++; } else { window._errCount = 0; }
+  if (window._errCount >= 2 && s.auto_target > 0) {
+    window._errCount = 0;
     addLog('⚠ [ERROR] 로봇 충돌/알람 감지 — 자동 수집 중단됨. Clear Alarm 후 재시작하세요.');
     api('POST','/pick-place/stop');
   }
@@ -1366,6 +1703,21 @@ setInterval(async () => {
     $('auto-bar').textContent = 'Running…';
   else
     $('auto-bar').textContent = 'Ready';
+
+  // 수집 모드 표시
+  const m = s.collect_mode || 'auto';
+  const mLabel = m === 'v10' ? '② v10 고정홈 (j3=42°, j4=-1.4°)' : '① 기존 랜덤포즈';
+  const mEl = $('mode-display');
+  if (mEl) {
+    mEl.textContent = '모드: ' + mLabel;
+    mEl.style.color = m === 'v10' ? '#a78bfa' : '#2dc653';
+  }
+  const bAuto = $('mode-btn-auto'), bV10 = $('mode-btn-v10');
+  if (bAuto && bV10) {
+    bAuto.style.fontWeight = m === 'auto' ? '700' : 'normal';
+    bV10.style.fontWeight  = m === 'v10'  ? '700' : 'normal';
+    bV10.style.background  = m === 'v10'  ? '#2d1f5e' : '';
+  }
 }, 800);
 
 // ── Jog logic ──────────────────────────────
@@ -1431,10 +1783,88 @@ const capturePose = async () => {
 // Misc handlers
 const autoCollect = () => api('POST','/pick-place/auto',{n:$('auto-n').value});
 const doEstop = () => { if(confirm('E-STOP?')) api('POST','/estop'); };
+const setCollectMode = async (mode) => {
+  const d = await api('POST', '/collect-mode', {mode});
+  if (d && d.ok) addLog(`✓ 모드 전환: ${mode}`);
+};
 const clearAlarm = async () => {
   const d = await api('POST','/clear-alarm');
   if(d&&d.ok) addLog('✓ Alarm cleared');
 };
+
+// ── 앵커 페어 선택 ─────────────────────────────────────────────────────────
+let _ancDir = 'auto', _ancA = -1, _ancB = -1;
+
+const _anchorApply = async () => {
+  try {
+    const params = new URLSearchParams({direction:_ancDir, a_idx:_ancA, b_idx:_ancB});
+    await fetch('/anchor?' + params, {method:'POST'});
+  } catch(e) { addLog('✗ anchor: ' + e); }
+  _anchorRefreshUI();
+};
+
+const anchorSetDir = dir  => { _ancDir = dir; _anchorApply(); };
+const anchorSetA   = idx  => { _ancA = idx;   _anchorApply(); };
+const anchorSetB   = idx  => { _ancB = idx;   _anchorApply(); };
+
+const _anchorRefreshUI = () => {
+  // Direction buttons
+  ['A','B','auto'].forEach(v => {
+    const el = $('dir-' + v);
+    if (el) el.className = (v === _ancDir) ? 'anc-active' : '';
+  });
+  // A anchor buttons
+  ['rand',0,1,2].forEach((v,i) => {
+    const id = 'aa-' + v;
+    const el = $(id);
+    if (el) el.className = ((i===0 ? -1 : i-1) === _ancA) ? 'anc-active' : '';
+  });
+  // B anchor buttons
+  ['rand',0,1,2].forEach((v,i) => {
+    const id = 'ba-' + v;
+    const el = $(id);
+    if (el) el.className = ((i===0 ? -1 : i-1) === _ancB) ? 'anc-active' : '';
+  });
+  // Display label
+  const aLbl = _ancA >= 0 ? (['A3','A4','A5'][_ancA] ?? '?') : '랜덤';
+  const bLbl = _ancB >= 0 ? (['B1','B2','B3'][_ancB] ?? '?') : '랜덤';
+  const dLbl = {A:'A→B', B:'B→A', auto:'Auto (교번)'}[_ancDir] ?? _ancDir;
+  const el = $('anchor-display');
+  if (el) el.textContent = `${dLbl} | A=${aLbl} | B=${bLbl}`;
+};
+
+// 앵커 상태 + 진행 현황 폴링 (2초마다)
+setInterval(async () => {
+  try {
+    const r = await fetch('/anchor-status');
+    const d = await r.json();
+    const counts = d.pair_counts || {};
+    // A→B 테이블: 행=a_idx(0~2), 열=b_idx(0~2)
+    for (let a = 0; a < 3; a++) {
+      for (let b = 0; b < 3; b++) {
+        const el = $(`pl-AB_${a}_${b}`);
+        if (el) {
+          const n = counts[`AB_${a}_${b}`] || 0;
+          el.textContent = n;
+          el.className = n > 0 ? 'pc has-data' : 'pc';
+        }
+      }
+    }
+    // B→A 테이블: 행=b_idx(0~2), 열=a_idx(0~2)
+    for (let b = 0; b < 3; b++) {
+      for (let a = 0; a < 3; a++) {
+        const el = $(`pl-BA_${b}_${a}`);
+        if (el) {
+          const n = counts[`BA_${b}_${a}`] || 0;
+          el.textContent = n;
+          el.className = n > 0 ? 'pc has-data' : 'pc';
+        }
+      }
+    }
+  } catch(e) {}
+}, 2000);
+
+_anchorRefreshUI();   // 초기 UI 상태 적용
 </script>
 </body>
 </html>"""

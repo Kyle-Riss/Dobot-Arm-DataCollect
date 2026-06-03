@@ -82,15 +82,15 @@ if CAMERA_AVAILABLE:
 
 
 # 좌표 정의 (1~9번)
-POS_1 = (139.37, -435.31, 100.84, 176.68, -3.05, -14.66)
-POS_2 = (145.59, -414.15, 100.97, -178.28, -3.94, -14.14)
-POS_3 = (217.75, -405.65, 100.05, 172.08, -0.15, -3.77)   # 3번
-POS_4 = (220.21, -368.72, 100.23, 179.75, 2.03, -1.86)   # 4번 (시작 위치)
-POS_5 = (221.63, -318.39, 100.10, -177.54, 5.35, 1.69)
-POS_6 = (94.10, -311.54, 100.91, 175.14, -1.08, -19.63)
-POS_7 = (84.97, -437.89, 100.85, -179.78, -2.11, -22.01)
-POS_8 = (-27.02, -438.80, 100.61, -173.78, -12.63, -15.91)
-POS_9 = (-15.38, -321.49, 100.67, -179.15, 0.60, 3.41)
+POS_1 = (139.37, -435.31, 120.0, 176.68, -3.05, -14.66)
+POS_2 = (145.59, -414.15, 120.0, -178.28, -3.94, -14.14)
+POS_3 = (217.75, -405.65, 120.0, 172.08, -0.15, -3.77)   # 3번
+POS_4 = (220.21, -368.72, 120.0, 179.75, 2.03, -1.86)   # 4번 (시작 위치)
+POS_5 = (221.63, -318.39, 120.0, -177.54, 5.35, 1.69)
+POS_6 = (94.10, -311.54, 120.0, 175.14, -1.08, -19.63)
+POS_7 = (84.97, -437.89, 120.0, -179.78, -2.11, -22.01)
+POS_8 = (-27.02, -438.80, 120.0, -173.78, -12.63, -15.91)
+POS_9 = (-15.38, -321.49, 120.0, -179.15, 0.60, 3.41)
 
 # A섹션: 1~7번 좌표로 정의된 파여있는 사각형 (다각형)
 # 순서: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 1 (닫힌 다각형)
@@ -104,7 +104,16 @@ A_SECTION_POINTS = [
     (POS_7[0], POS_7[1]),  # 7번
 ]
 
-# B섹션: 6~9번 좌표로 정의된 사각형
+# v10 수집용 A section 안전 폴리곤: POS_1/2/6/7 제외
+# POS_2(X=145): X<200 구간에서 j3_at_grasp≈35~40° → dj3 기준 미달 실측 확인
+# POS_3/4/5(X≈218~222)만 사용: j3_at_grasp≈49° 안정적으로 dj3≥0.4 보장
+A_SECTION_V10_POINTS = [
+    (POS_3[0], POS_3[1]),  # 3번 (217.75, -405.65)
+    (POS_4[0], POS_4[1]),  # 4번 (220.21, -368.72)
+    (POS_5[0], POS_5[1]),  # 5번 (221.63, -318.39)
+]
+
+# B섹션: 6~9번 좌표로 정의된 사각형 (안전 좌표 원본 — 추론/안전 용도)
 # 순서: 6 -> 7 -> 8 -> 9 -> 6 (사각형)
 B_SECTION_POINTS = [
     (POS_6[0], POS_6[1]),  # 6번
@@ -147,6 +156,25 @@ PHASE1_FIXED_PLACE_B_XY = PHASE1_FIXED_B_CENTER_SMALL_XY
 PHASE1_FIXED_PICK_B_XY = PHASE1_FIXED_B_CENTER_SMALL_XY
 PHASE1_FIXED_PLACE_A_XY = PHASE1_FIXED_A_CENTER_SMALL_XY
 
+# ── Anchor-based collection (v20+) ────────────────────────────────────────
+# A 섹션 pick 앵커 3개: POS_3 / POS_4 / POS_5 (XY만 사용, RPY는 A_SECTION_RX/RY/RZ 공용)
+A_ANCHORS = [
+    (POS_3[0], POS_3[1]),   # A3: (217.75, -405.65)
+    (POS_4[0], POS_4[1]),   # A4: (220.21, -368.72)  ← 기존 고정 pick 위치
+    (POS_5[0], POS_5[1]),   # A5: (221.63, -318.39)
+]
+
+# B 섹션 place 앵커 3개: B 섹션 중앙 기준 Y 방향 분산 (J1 회전 최소화)
+# X=30 고정, Y를 37mm 간격으로 배치 → 클러스터(±10mm)가 겹치지 않음
+B_ANCHORS = [
+    (30.0, -340.0),   # B1: 상단
+    (30.0, -377.0),   # B2: 중앙
+    (30.0, -415.0),   # B3: 하단
+]
+
+# 앵커 중심에서 pick/place 샘플링할 노이즈 범위 (mm)
+ANCHOR_NOISE_MM = 10.0
+
 
 # Image–state row 규약 (한 row 안 처리 순서; _on_record_tick 와 동일 의미로 문서화)
 SYNC_POLICY_STRING = "feedback_first_camera_second_row_timestamp_end"
@@ -183,11 +211,14 @@ RED_SEARCH_X_STEP = -50.0         # 한 번에 이동할 X- 스텝(mm)
 RED_SEARCH_MAX_STEPS = 4          # 최대 시도 횟수
 RED_DETECT_MIN_AREA = 500         # 빨간 블록 감지용 최소 픽셀 수 (튜닝 가능)
 
-RELEASE_Z = 101.7   # 그리퍼 해제/픽 높이 (실측 기준 Z≈101.7에서 동작)
+RELEASE_Z = 120.0   # 그리퍼 해제/픽 높이 (실측 기준 Z≈101.7에서 동작)
 RELEASE_Z_TOLERANCE_MM = 1.5   # Z 도달 판정 허용 오차 (대략 100.2~103.2)
 PLACE_WAIT_AT_101_S = 2.0   # Place 시 Z 도달 후 release 전 대기 시간(초)
 Z_MOVE_MIN, Z_MOVE_MAX = 150.0, 300.0   # Pick/Place 후 궤적용 Z 랜덤 범위 (최소 150~최대 300)
-Z_AFTER_RELEASE = 200.0   # Release 후 Z 높이
+A_SECTION_Z_MAX = 210.0   # A section XY에서 안전한 최대 Z — 초과 시 mode=9 (joint limit)
+B_SECTION_Z_MAX = 240.0   # B section XY에서 안전한 최대 Z — 275mm 이상에서 mode=9 확인됨
+CROSS_SECTION_Z_MAX = 190.0  # B→A 크로스섹션 carry Z 상한 — B-arm(j3≈65-94°)은 transit XY에서 210mm도 mode=9 (ep4 실측)
+Z_AFTER_RELEASE = 200.0   # Release 후 Z 높이 (A→B 전용, B→A는 joint-space 복귀로 생략)
 
 # Pick/Place 공통: Z 130에서 고정 후 101까지 하강 (사용자 지정)
 DESCENT_MID_Z = 130.0   # 130mm에서 잠시 고정 후 101로 (Pick·Place 동일)
@@ -195,7 +226,7 @@ DESCENT_MID_Z = 130.0   # 130mm에서 잠시 고정 후 101로 (Pick·Place 동�
 DESCENT_RX = 176.4624
 DESCENT_RY = -1.7726
 DESCENT_RZ = 8.1319
-DESCENT_VELOCITY = 14.0   # 130→101 하강 속도 (8보다 상향)
+DESCENT_VELOCITY = 30.0   # 130→120 하강 속도
 # 130→101 하강 시 Rx 오프셋 (그립 정렬 보정)
 DESCENT_RX_OFFSET_DEG = 1.0
 
@@ -206,6 +237,11 @@ TRAVEL_RZ = DESCENT_RZ
 
 INIT_X, INIT_Y, INIT_Z = 89.3715, -102.9836, 611.7122   # INIT = 대기(홈) 위치
 INIT_RX, INIT_RY, INIT_RZ = 90.1244, 3.6761, 5.7400
+
+# 관절 구성 가드: j1 > 0°, j5 < 0° 이어야 정상 수집 방향
+# 반전 구성(j1 < 0°)에서 수집하면 학습 데이터 오염 (2026-05-02 분리 사건)
+_JOINT_CONFIG_J1_MIN = 0.0   # j1 이 이 값보다 작으면 반전 구성
+_JOINT_CONFIG_J5_MAX = 0.0   # j5 이 이 값보다 크면 반전 구성
 
 # 130→101 하강 시 (x,y)별 RPY 보정 테이블 (descent_calib_result.py 또는 descent_calibration.DESCENT_CALIB_TABLE)
 _DESCENT_CALIB_TABLE = None
@@ -288,7 +324,7 @@ LEVEL2_MAX_TRIES = 1   # Level 2 최대 XY 시도 1점만 → 총 픽 시도 3�
 LEVEL2_DWELL_S = 0.25   # Level 2 각 시도 시 suction dwell (초)
 LEVEL2_Z_SEARCH_HI_LO, LEVEL2_Z_SEARCH_HI_HI = 150.0, 160.0   # 탐색 높이 mm (Z 다이브 없음, 한 번만 내려서 grip)
 
-# 실측 기록 레이트 (QTimer 50ms + 카메라 오버헤드 → 실제 ~15Hz)
+# 실측 기록 레이트 (QTimer 50ms + 카메라 오버헤드 → 실제 ~15~16Hz)
 RECORD_INTERVAL_MS = 50
 RECORD_RATE_HZ = 15
 
@@ -341,6 +377,13 @@ def generate_random_point_in_section(section_points, max_attempts=100):
     return (cx, cy)
 
 
+def generate_point_around_anchor(anchor_x, anchor_y, noise=ANCHOR_NOISE_MM):
+    """앵커 중심에서 ±noise mm 범위 내 균등 샘플링."""
+    x = anchor_x + random.uniform(-noise, noise)
+    y = anchor_y + random.uniform(-noise, noise)
+    return (x, y)
+
+
 class PickPlaceStepWorker(QThread):
     """한 스텝: A섹션 Pick → B섹션 Place 또는 B섹션 Pick → A섹션 Place."""
     finished = pyqtSignal(bool)
@@ -353,12 +396,13 @@ class PickPlaceStepWorker(QThread):
     def __init__(self, robot, gripper, pick_section="A",
                  pick_x=None, pick_y=None, pick_rx=None, pick_ry=None, pick_rz=None,
                  camera=None, fallback_initial_pose=None, phase1_episode_direction=None,
-                 phase1_pick_xy_origin=None):
+                 phase1_pick_xy_origin=None, velocity_scale=1.0):
         super().__init__()
         self.robot = robot
         self.gripper = gripper
         self.camera = camera  # HikRobotCamera (또는 None)
         self._stop_requested = False
+        self._vel_scale = max(0.1, min(velocity_scale, 3.0))  # 0.1~3.0 클램프
         # None | "A_to_B" | "B_to_A" — Phase 1 전용: center_small 샘플, last_place 비활성 GUI와 함께 사용
         self.phase1_episode_direction = phase1_episode_direction
         # Phase1 B_to_A: previous_episode_place = 직전 AB place 좌표를 pick source로 (메타에 명시)
@@ -372,11 +416,15 @@ class PickPlaceStepWorker(QThread):
         self.pick_rz = pick_rz
         # 첫 MovJ(INIT) 실패 시 시도할 대체 포즈 (x,y,z,rx,ry,rz) 또는 None
         self.fallback_initial_pose = fallback_initial_pose
+        # 앵커 선택 결과 (anchor-based collection용, Phase1에서는 None 유지)
+        self._selected_a_anchor = None
+        self._selected_b_anchor = None
         # Place 위치 저장 (다음 스텝에서 사용)
         self.place_x = None
         self.place_y = None
         self.place_section = None
         self._events = []   # [(event_name, timestamp), ...]
+        self._init_joints = None  # 에피소드 시작 시 INIT 관절각 (joint-space 복귀용)
 
     def request_stop(self):
         self._stop_requested = True
@@ -384,7 +432,7 @@ class PickPlaceStepWorker(QThread):
     def _log(self, msg):
         self.log_signal.emit(msg)
 
-    def _move(self, x, y, z, velocity=25.0, rx=None, ry=None, rz=None):
+    def _move(self, x, y, z, velocity=50.0, rx=None, ry=None, rz=None):
         if self._stop_requested:
             return False
         # rx, ry, rz가 None이면 기본값 사용 (A섹션 회전값)
@@ -394,7 +442,8 @@ class PickPlaceStepWorker(QThread):
             ry = A_SECTION_RY
         if rz is None:
             rz = A_SECTION_RZ
-        ok = self.robot.move_j(x, y, z, rx, ry, rz, coordinate_mode=0, velocity=velocity, use_waypoint=False)
+        ok = self.robot.move_j(x, y, z, rx, ry, rz, coordinate_mode=0,
+                               velocity=min(velocity * self._vel_scale, 90.0), use_waypoint=False)
         if ok:
             self.robot.wait_for_motion_complete()
         return ok
@@ -424,6 +473,19 @@ class PickPlaceStepWorker(QThread):
             self._move(x, y, RELEASE_Z, velocity=18.0, rx=rx, ry=ry, rz=rz)   # Z=101로 내리고
             self.gripper.release(wait_time=wait_time)
 
+    def _return_home_joint(self):
+        """저장된 _init_joints로 joint-space 복귀 → j1 반전 방지."""
+        if self._init_joints and self.robot and self.robot.connected:
+            j = self._init_joints
+            ok = self.robot.move_j(j[0], j[1], j[2], j[3], j[4], j[5],
+                                   coordinate_mode=1,
+                                   velocity=min(80.0 * self._vel_scale, 90.0), accel=80.0)
+            if ok:
+                self.robot.wait_for_motion_complete()
+            return ok
+        # fallback: Cartesian
+        return self._move(INIT_X, INIT_Y, INIT_Z, rx=INIT_RX, ry=INIT_RY, rz=INIT_RZ)
+
     def _safe_return_home(self):
         """실패/중단 시 초기 자세(홈)로 복귀 → 재시도 전 준비."""
         if not self.robot or not self.robot.connected:
@@ -435,7 +497,7 @@ class PickPlaceStepWorker(QThread):
                 except Exception:
                     pass
             self._log("실패 → 초기 자세로 복귀 중...")
-            self._move(INIT_X, INIT_Y, INIT_Z, rx=INIT_RX, ry=INIT_RY, rz=INIT_RZ)
+            self._return_home_joint()
         except Exception as e:
             self._log(f"초기 복귀 실패: {e}")
 
@@ -582,7 +644,6 @@ class PickPlaceStepWorker(QThread):
                 pick_z = RELEASE_Z
                 pick_rx, pick_ry, pick_rz = A_SECTION_RX, A_SECTION_RY, A_SECTION_RZ
                 place_section = "B"
-                place_section_points = B_SECTION_POINTS
                 place_rx, place_ry, place_rz = B_SECTION_RX, B_SECTION_RY, B_SECTION_RZ
                 place_x, place_y = PHASE1_FIXED_PLACE_B_XY
                 self.phase1_place_xy_origin = "fixed_anchor_B_center_small_centroid"
@@ -612,42 +673,35 @@ class PickPlaceStepWorker(QThread):
                 pick_z = RELEASE_Z
                 pick_rx, pick_ry, pick_rz = B_SECTION_RX, B_SECTION_RY, B_SECTION_RZ
                 place_section = "A"
-                place_section_points = A_SECTION_POINTS
                 place_rx, place_ry, place_rz = A_SECTION_RX, A_SECTION_RY, A_SECTION_RZ
                 place_x, place_y = PHASE1_FIXED_PLACE_A_XY
                 self.phase1_place_xy_origin = "fixed_anchor_A_center_small_centroid"
                 place_z = RELEASE_Z
             elif self.pick_section == "A":
-                # A섹션: pick_x, pick_y가 None이면 4번 좌표 사용 (시작 위치)
-                if self.pick_x is None or self.pick_y is None:
-                    pick_x, pick_y, pick_z = POS_4[0], POS_4[1], POS_4[2]
-                    pick_rx, pick_ry, pick_rz = POS_4[3], POS_4[4], POS_4[5]
-                else:
-                    pick_x, pick_y = self.pick_x, self.pick_y
-                    pick_z = RELEASE_Z
-                    pick_rx = self.pick_rx if self.pick_rx is not None else A_SECTION_RX
-                    pick_ry = self.pick_ry if self.pick_ry is not None else A_SECTION_RY
-                    pick_rz = self.pick_rz if self.pick_rz is not None else A_SECTION_RZ
+                # A섹션: A_ANCHORS 중 랜덤 선택 후 ±ANCHOR_NOISE_MM 샘플링
+                _a_anchor = random.choice(A_ANCHORS)
+                pick_x, pick_y = generate_point_around_anchor(_a_anchor[0], _a_anchor[1])
+                self._selected_a_anchor = _a_anchor
+                pick_z = RELEASE_Z
+                pick_rx, pick_ry, pick_rz = A_SECTION_RX, A_SECTION_RY, A_SECTION_RZ
                 place_section = "B"
-                place_section_points = B_SECTION_POINTS
                 place_rx, place_ry, place_rz = B_SECTION_RX, B_SECTION_RY, B_SECTION_RZ
-                # Place 위치: 반대 섹션 내 랜덤 좌표 생성
-                place_x, place_y = generate_random_point_in_section(B_SECTION_POINTS)
+                _b_anchor = random.choice(B_ANCHORS)
+                place_x, place_y = generate_point_around_anchor(_b_anchor[0], _b_anchor[1])
+                self._selected_b_anchor = _b_anchor
                 place_z = RELEASE_Z
             else:  # "B"
-                # B섹션: pick_x, pick_y가 None이면 랜덤 좌표 생성 (또는 이전에 Place한 위치 사용)
-                if self.pick_x is None or self.pick_y is None:
-                    pick_x, pick_y = generate_random_point_in_section(B_SECTION_POINTS)
-                else:
-                    pick_x, pick_y = self.pick_x, self.pick_y
+                # B섹션: B_ANCHORS 중 랜덤 선택 후 ±ANCHOR_NOISE_MM 샘플링
+                _b_anchor = random.choice(B_ANCHORS)
+                pick_x, pick_y = generate_point_around_anchor(_b_anchor[0], _b_anchor[1])
+                self._selected_b_anchor = _b_anchor
                 pick_z = RELEASE_Z
-                pick_rx = self.pick_rx if self.pick_rx is not None else B_SECTION_RX
-                pick_ry = self.pick_ry if self.pick_ry is not None else B_SECTION_RY
-                pick_rz = self.pick_rz if self.pick_rz is not None else B_SECTION_RZ
+                pick_rx, pick_ry, pick_rz = B_SECTION_RX, B_SECTION_RY, B_SECTION_RZ
                 place_section = "A"
-                place_section_points = A_SECTION_POINTS
                 place_rx, place_ry, place_rz = A_SECTION_RX, A_SECTION_RY, A_SECTION_RZ
-                place_x, place_y = generate_random_point_in_section(place_section_points)
+                _a_anchor = random.choice(A_ANCHORS)
+                place_x, place_y = generate_point_around_anchor(_a_anchor[0], _a_anchor[1])
+                self._selected_a_anchor = _a_anchor
                 place_z = RELEASE_Z
             # Place 위치 Y에 따라 RX 동적 보정 (특수 7-8 구간 RPY 적용 전)
             place_rx = self._compute_dynamic_rx(place_y, place_rx)
@@ -679,6 +733,19 @@ class PickPlaceStepWorker(QThread):
                     self._log("Failed: initial position")
                     self._fail_and_go_home()
                     return
+            # INIT 도달 후 관절각 저장 → 에피소드 종료 시 joint-space 복귀에 사용
+            if self.robot:
+                self._init_joints = self.robot.get_current_joints_from_feedback()
+
+            # pre-approach 조인트 강제 이동은 비활성화.
+            # 홈포즈 조인트를 그대로 유지한 채 시작한다.
+            if self._init_joints:
+                self._log(
+                    f"[{self.pick_section} section] start joints: "
+                    f"j1={self._init_joints[0]:.1f} j2={self._init_joints[1]:.1f} "
+                    f"j3={self._init_joints[2]:.1f} j4={self._init_joints[3]:.1f} "
+                    f"j5={self._init_joints[4]:.1f} j6={self._init_joints[5]:.1f}"
+                )
 
             # 1.2) 초기 자세에서 1초 대기 → 20Hz 기록 시작
             self._log("1.2) Holding at initial pose 1s...")
@@ -687,6 +754,19 @@ class PickPlaceStepWorker(QThread):
                     self._fail_and_go_home()
                     return
                 time.sleep(0.1)
+            # 관절 구성 가드: 반전 IK 해 감지 시 에피소드 중단
+            if self.robot:
+                joints = self.robot.get_current_joints_from_feedback()
+                if joints is not None:
+                    j1, j5 = joints[0], joints[4]
+                    if j1 < _JOINT_CONFIG_J1_MIN or j5 > _JOINT_CONFIG_J5_MAX:
+                        self._log(
+                            f"[ABORT] 반전 관절 구성 감지 — j1={j1:.1f}° j5={j5:.1f}°\n"
+                            f"  로봇을 끄고 정상 구성(j1>0°, j5<0°)으로 복귀 후 재시작하세요."
+                        )
+                        self._fail_and_go_home()
+                        return
+
             if self.phase1_episode_direction:
                 if not self._phase1_visible_init_gate():
                     self._log("Phase1: visible_init_gate failed — recording not started")
@@ -696,8 +776,13 @@ class PickPlaceStepWorker(QThread):
 
             # 2) Pick 위치로 이동 — 공통 RPY로 꺾임 방지
             z_move = random.uniform(Z_MOVE_MIN, Z_MOVE_MAX)
+            # Pick 위치 section에 따라 mode=9 방지 Z 상한 적용
+            if self.pick_section == "A":
+                z_move = min(z_move, A_SECTION_Z_MAX)
+            elif self.pick_section == "B":
+                z_move = min(z_move, B_SECTION_Z_MAX)
             self._log(f"2) Moving to {self.pick_section} section Pick position (Z={z_move:.1f}mm, travel RPY)...")
-            if not self._move(pick_x, pick_y, z_move, velocity=24.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(pick_x, pick_y, z_move, velocity=60.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log("Failed: move to pick position")
                 self._fail_and_go_home()
                 return
@@ -708,7 +793,7 @@ class PickPlaceStepWorker(QThread):
 
             # 3) Pick 하강: 130까지 공통 RPY, 130→101.7 은 (x,y)별 보정 RPY
             self._log(f"3) Descending to Z={DESCENT_MID_Z:.1f} for Pick (travel RPY)...")
-            if not self._move(pick_x, pick_y, DESCENT_MID_Z, velocity=18.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(pick_x, pick_y, DESCENT_MID_Z, velocity=40.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log(f"Failed: descend to Z={DESCENT_MID_Z:.1f} for pick")
                 self._fail_and_go_home()
                 return
@@ -741,14 +826,22 @@ class PickPlaceStepWorker(QThread):
 
             # 4) Pick 후: Z=130 → 랜덤 Z 까지 공통 RPY로 올림 (꺾임 방지)
             self._log(f"4) Lifting to Z={DESCENT_MID_Z:.1f}mm with object (travel RPY)...")
-            if not self._move(pick_x, pick_y, DESCENT_MID_Z, velocity=18.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(pick_x, pick_y, DESCENT_MID_Z, velocity=40.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log("Failed: lift to Z=130 after pick")
                 self._release_at_safe_z(pick_x, pick_y, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ)
                 self._fail_and_go_home()
                 return
             z_move2 = random.uniform(Z_MOVE_MIN, Z_MOVE_MAX)
+            # A section 경유 시 상한 우선 적용 (B→A carry도 A section XY에 도달하므로 포함)
+            if self.pick_section == "A" or place_section == "A":
+                z_move2 = min(z_move2, A_SECTION_Z_MAX)
+            elif self.pick_section == "B" or place_section == "B":
+                z_move2 = min(z_move2, B_SECTION_Z_MAX)
+            # B→A 크로스섹션: B-arm(j3≈65-94°)은 transit XY에서 210mm도 mode=9 → 190mm로 추가 제한
+            if self.pick_section == "B" and place_section == "A":
+                z_move2 = min(z_move2, CROSS_SECTION_Z_MAX)
             self._log(f"4.1) Lifting to Z={z_move2:.1f}mm (travel RPY)...")
-            if not self._move(pick_x, pick_y, z_move2, velocity=24.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(pick_x, pick_y, z_move2, velocity=60.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log("Failed: lift to random Z")
                 self._release_at_safe_z(pick_x, pick_y, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ)
                 self._fail_and_go_home()
@@ -756,7 +849,7 @@ class PickPlaceStepWorker(QThread):
 
             # 5) Place 위치로 이동 — 공통 RPY로 XY만 이동 (꺾임 방지)
             self._log(f"5) Moving to {place_section} section Place position (travel RPY)...")
-            if not self._move(place_x, place_y, z_move2, velocity=24.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(place_x, place_y, z_move2, velocity=60.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log("Failed: move to place position")
                 self._release_at_safe_z(place_x, place_y, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ)
                 self._fail_and_go_home()
@@ -764,7 +857,7 @@ class PickPlaceStepWorker(QThread):
 
             # 6) Place 하강: 130까지 공통 RPY, 130→101.7 은 (x,y)별 보정 RPY
             self._log(f"6) Descending to Z={DESCENT_MID_Z:.1f} for Place (travel RPY)...")
-            if not self._move(place_x, place_y, DESCENT_MID_Z, velocity=18.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(place_x, place_y, DESCENT_MID_Z, velocity=40.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log(f"Failed: descend to Z={DESCENT_MID_Z:.1f} for place → 현재 위치에서 그리퍼 해제 시도")
                 if self.gripper:
                     self.gripper.release(wait_time=0.2)
@@ -822,45 +915,70 @@ class PickPlaceStepWorker(QThread):
 
             # 7) Place 후: Z=130 → 랜덤 Z → Z=200 까지 공통 RPY로 올림 (꺾임 방지)
             self._log(f"7) Lifting to Z={DESCENT_MID_Z:.1f} (travel RPY)...")
-            if not self._move(place_x, place_y, DESCENT_MID_Z, velocity=18.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+            if not self._move(place_x, place_y, DESCENT_MID_Z, velocity=40.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
                 self._log("Failed: lift to Z=130 after place")
                 self._fail_and_go_home()
                 return
-            z_after_place = random.uniform(Z_MOVE_MIN, Z_MOVE_MAX)
-            self._log(f"7.1) Lifting to Z={z_after_place:.1f} (travel RPY)...")
-            if not self._move(place_x, place_y, z_after_place, velocity=24.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
-                self._log("Failed: lift to random Z after place")
-                self._fail_and_go_home()
-                return
-            self._log("7.2) Lifting to Z=200 (travel RPY)...")
-            if not self._move(place_x, place_y, Z_AFTER_RELEASE, velocity=30.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
-                self._log("Failed: lift to Z=200")
-                self._fail_and_go_home()
-                return
+            if self.pick_section == "B" and place_section == "A":
+                # B→A: A-section XY에서 B-arm(j3≈27°) 상태로 TCP 상승 시 j3가 더 낮아져 mode=9 발생
+                # (ep4 실측: 130mm→171.5mm 상승 중 j3=18.7°에서 joint limit 트리거)
+                # 7.1/7.2/8 TCP 상승 단계 생략 → Z=130mm에서 바로 joint-space 복귀
+                self._log("7.1) [B→A] TCP 상승 생략 — Z=130mm에서 joint-space 복귀")
+            else:
+                z_after_place = random.uniform(Z_MOVE_MIN, Z_MOVE_MAX)
+                if place_section == "A":
+                    z_after_place = min(z_after_place, A_SECTION_Z_MAX)
+                elif place_section == "B":
+                    z_after_place = min(z_after_place, B_SECTION_Z_MAX)
+                self._log(f"7.1) Lifting to Z={z_after_place:.1f} (travel RPY)...")
+                if not self._move(place_x, place_y, z_after_place, velocity=60.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+                    self._log("Failed: lift to random Z after place")
+                    self._fail_and_go_home()
+                    return
+                self._log("7.2) Lifting to Z=200 (travel RPY)...")
+                if not self._move(place_x, place_y, Z_AFTER_RELEASE, velocity=70.0, rx=TRAVEL_RX, ry=TRAVEL_RY, rz=TRAVEL_RZ):
+                    self._log("Failed: lift to Z=200")
+                    self._fail_and_go_home()
+                    return
+                self._log("8) Aligning to INIT RPY at current XY...")
+                if not self._move(place_x, place_y, Z_AFTER_RELEASE, velocity=50.0, rx=INIT_RX, ry=INIT_RY, rz=INIT_RZ):
+                    self._log("Failed: align to INIT RPY")
+                    self._fail_and_go_home()
+                    return
 
-            # 8) 복귀 전 현재 위치에서 INIT RPY로 맞춘 뒤 초기 위치로 복귀 (꺾임 방지)
-            self._log("8) Aligning to INIT RPY at current XY...")
-            if not self._move(place_x, place_y, Z_AFTER_RELEASE, velocity=20.0, rx=INIT_RX, ry=INIT_RY, rz=INIT_RZ):
-                self._log("Failed: align to INIT RPY")
-                self._fail_and_go_home()
-                return
             self._log("8.1) Returning to initial position...")
-            if not self._move(INIT_X, INIT_Y, INIT_Z, rx=INIT_RX, ry=INIT_RY, rz=INIT_RZ):
+            if not self._return_home_joint():
                 self._log("Failed: return to initial")
                 self._fail_and_go_home()
                 return
 
             self._log(f"Step complete ({self.pick_section} section Pick → {place_section} section Place).")
             self.episode_vacuum_durations.emit(pick_hold, place_hold)
+            _zone = {"A": "left", "B": "right"}
+            _src  = _zone.get(self.pick_section, self.pick_section)
+            _dst  = _zone.get(place_section,      place_section)
+            _prompt = (
+                f"pick up the orange box from the {_src} side "
+                f"and place it on the {_dst} side"
+            )
             self.episode_meta_ready.emit({
                 "task_name": "pick_and_place",
-                "object_label": "red_block",
+                "object_label": "orange_box",
+                "object_marker": "barcode",
+                "workspace": "checkerboard",
+                "source_zone": _src,
+                "target_zone": _dst,
+                "prompt": _prompt,
                 "pick_section": self.pick_section,
                 "pick_x": round(pick_x, 3),
                 "pick_y": round(pick_y, 3),
+                "pick_anchor": list(self._selected_a_anchor) if self.pick_section == "A" and self._selected_a_anchor else
+                               list(self._selected_b_anchor) if self.pick_section == "B" and self._selected_b_anchor else None,
                 "place_section": place_section,
                 "place_x": round(place_x, 3),
                 "place_y": round(place_y, 3),
+                "place_anchor": list(self._selected_b_anchor) if place_section == "B" and self._selected_b_anchor else
+                                list(self._selected_a_anchor) if place_section == "A" and self._selected_a_anchor else None,
                 "transport_direction": _transport_direction(place_x, place_y),
                 "success": True,
                 "events": list(self._events),

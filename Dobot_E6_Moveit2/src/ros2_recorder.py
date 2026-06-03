@@ -31,7 +31,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import Image, JointState
-    from std_msgs.msg import Float32MultiArray
+    from std_msgs.msg import Float32MultiArray, Int32
     import message_filters
     from cv_bridge import CvBridge
     _ROS2_AVAILABLE = True
@@ -44,6 +44,8 @@ except ImportError:
     class JointState:     # type: ignore[no-redef]
         pass
     class Float32MultiArray:  # type: ignore[no-redef]
+        pass
+    class Int32:              # type: ignore[no-redef]
         pass
 
 
@@ -72,6 +74,8 @@ class _DobotRecorderNode(Node):
         self._pub_zed    = self.create_publisher(Image,             '/dobot/zed/image_raw', 5)
         self._pub_joints = self.create_publisher(JointState,        '/dobot/joint_states',  5)
         self._pub_tcp    = self.create_publisher(Float32MultiArray, '/dobot/tcp_pose',       5)
+        self._pub_mode   = self.create_publisher(Int32,             '/dobot/robot_mode',     5)
+        self._prev_mode  : int = -1
 
         # ── 로봇 상태 캐시 (publish_robot 에서 갱신) ───────────────────────
         self._joints  : list = []
@@ -94,8 +98,8 @@ class _DobotRecorderNode(Node):
         sub_zed = message_filters.Subscriber(self, Image, '/dobot/zed/image_raw')
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [sub_hik, sub_zed],
-            queue_size=15,
-            slop=0.035,     # 35 ms 허용 오차 (20 Hz 기준 프레임 주기 50 ms 의 70%)
+            queue_size=30,
+            slop=0.08,      # 80 ms 허용 오차 — 카메라 간 타임스탬프 jitter 대응
         )
         self._sync.registerCallback(self._on_sync)
 
@@ -127,11 +131,30 @@ class _DobotRecorderNode(Node):
         tp.data = [float(v) for v in tcp_pose]
         self._pub_tcp.publish(tp)
 
+        mode_int = int(robot_mode)
+        m = Int32()
+        m.data = mode_int
+        self._pub_mode.publish(m)
+
+        # 모드 변경 시 경고 로그
+        if mode_int != self._prev_mode:
+            _MODE_LABELS = {
+                1: 'INIT', 2: 'BRAKE_OPEN', 3: 'POWEROFF', 4: 'DISABLED',
+                5: 'ENABLE(idle)', 6: 'BACKDRIVE', 7: 'RUNNING',
+                8: 'SINGLE_MOVE', 9: 'ERROR', 10: 'PAUSE', 11: 'COLLISION',
+            }
+            label = _MODE_LABELS.get(mode_int, str(mode_int))
+            if mode_int in (9, 11):
+                self.get_logger().error(f'[robot_mode] → {mode_int} ({label})')
+            else:
+                self.get_logger().info(f'[robot_mode] → {mode_int} ({label})')
+            self._prev_mode = mode_int
+
         with self._lock:
             self._joints  = list(joints)
             self._tcp     = list(tcp_pose)
             self._gripper = int(gripper_on)
-            self._mode    = int(robot_mode)
+            self._mode    = mode_int
 
     # ── 레코딩 제어 ───────────────────────────────────────────────────────────
 

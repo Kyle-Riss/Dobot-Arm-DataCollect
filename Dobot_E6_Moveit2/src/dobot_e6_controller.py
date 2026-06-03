@@ -136,6 +136,28 @@ class DobotE6Controller:
             result = self.dashboard.ClearError()
             print(f"Clear error: {result}")
             time.sleep(0.5)  # Wait a bit after clearing error
+
+    def _get_robot_mode(self) -> int:
+        """RobotMode() 응답에서 모드 번호를 파싱해 반환. 실패 시 -1."""
+        try:
+            result = self.dashboard.RobotMode()
+            if result is None:
+                return -1
+            # 응답 형식: "0,{mode},RobotMode();"
+            import re
+            m = re.search(r'\{(\d+)\}', str(result))
+            return int(m.group(1)) if m else -1
+        except Exception:
+            return -1
+
+    def _recover_if_needed(self):
+        """로봇 상태를 확인해 에러/정지/충돌 상태일 때만 복구 루틴 실행."""
+        mode = self._get_robot_mode()
+        if mode == 10:   # PAUSE
+            self.resume_robot()
+        elif mode in (9, 11):  # ERROR or COLLISION
+            self.clear_error()
+            self.enable_robot(sleep_after=0.1)
     
     def move_j_relative(self, dx: float, dy: float, dz: float, drx: float = 0, dry: float = 0, drz: float = 0,
                         velocity: int = 30) -> bool:
@@ -260,8 +282,8 @@ class DobotE6Controller:
         
         return True, "Position appears reachable (estimated)"
     
-    def move_j(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, 
-               velocity: float = 30.0, coordinate_mode: int = 0, use_waypoint: bool = False) -> bool:
+    def move_j(self, x: float, y: float, z: float, rx: float, ry: float, rz: float,
+               velocity: float = 30.0, accel: float = 50.0, coordinate_mode: int = 0, use_waypoint: bool = False) -> bool:
         """
         Move to position in joint space (point-to-point)
         
@@ -279,10 +301,8 @@ class DobotE6Controller:
             print("✗ Dashboard not connected")
             return False
         
-        # 이동 전 상태 복구: PAUSE(10) → resume, ERROR(9) → clear+enable
-        self.resume_robot()
-        self.clear_error()
-        self.enable_robot(sleep_after=0.1)
+        # 이동 전 상태 복구: 필요한 경우에만 실행
+        self._recover_if_needed()
         
         # (이전 단순 동작으로 복구) move_j에서는 추가 속도 조정/경고 없이 그대로 명령만 보냄
         radius = None
@@ -292,13 +312,9 @@ class DobotE6Controller:
         # 조인트 모드: MovJ(joint, 1) 사용. RunTo는 일부 컨트롤러에서 미동작할 수 있음.
         # VelJ로 관절 속도 설정 후 MovJ 전송 (연속 재생에 유리)
         if coordinate_mode == 1:
-            try:
-                self.dashboard.VelJ(int(velocity))
-            except Exception:
-                pass
-            result = self.dashboard.MovJ(x, y, z, rx, ry, rz, 1, v=int(velocity), a=50)
+            result = self.dashboard.MovJ(x, y, z, rx, ry, rz, 1, v=int(velocity), a=int(accel))
         else:
-            result = self.dashboard.MovJ(x, y, z, rx, ry, rz, coordinate_mode, v=int(velocity), a=50)
+            result = self.dashboard.MovJ(x, y, z, rx, ry, rz, coordinate_mode, v=int(velocity), a=int(accel))
         
         # Check for errors in result
         # Note: MovJ may return None, empty string, or error code string
@@ -738,6 +754,18 @@ class DobotE6Controller:
         
         return None
     
+    def get_current_joints_from_feedback(self) -> Optional[List[float]]:
+        """Returns [j1, j2, j3, j4, j5, j6] in degrees, or None if failed."""
+        if not self.feed:
+            return None
+        try:
+            data = self.feed.feedBackData()
+            if data is not None and len(data) > 0:
+                return data['QActual'][0].tolist()
+        except Exception as e:
+            print(f"✗ Failed to get joints from feedback: {e}")
+        return None
+
     def get_current_pose_from_feedback(self) -> Optional[List[float]]:
         """
         Get current robot pose from feedback data

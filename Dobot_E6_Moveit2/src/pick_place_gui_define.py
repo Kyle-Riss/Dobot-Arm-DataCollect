@@ -23,8 +23,8 @@ def _dataset_root_for_direction(direction: str) -> str:
 
 
 _FIXED_INIT_MM = (89.3715, -102.9836, 611.7122, 90.1244, 3.6761, 5.7400)
-TEXT_PROMPT_A_TO_B = "pick up the red block from section A and place it in section B"
-TEXT_PROMPT_B_TO_A = "pick up the red block from section B and place it in section A"
+TEXT_PROMPT_A_TO_B = "pick up the orange box from the left side and place it on the right side"
+TEXT_PROMPT_B_TO_A = "pick up the orange box from the right side and place it on the left side"
 
 
 def _apply_fixed_init_to_base_module():
@@ -96,10 +96,10 @@ class PickPlaceGUIDefine(base.PickPlaceGUINew):
                 "phase": "phase1",
                 "dataset_root_relative": f"vla_dataset_define/{_SUBDIR_A_TO_B if d == 'A_to_B' else _SUBDIR_B_TO_A}",
                 "episode_direction": d,
-                "pick_section": "A" if d == "A_to_B" else "B",
-                "place_section": "B" if d == "A_to_B" else "A",
-                "object_region": "A_center_small" if d == "A_to_B" else "B_center_small",
-                "target_region": "B_center_small" if d == "A_to_B" else "A_center_small",
+                "pick_section": "left" if d == "A_to_B" else "right",
+                "place_section": "right" if d == "A_to_B" else "left",
+                "object_region": "left_center_small" if d == "A_to_B" else "right_center_small",
+                "target_region": "right_center_small" if d == "A_to_B" else "left_center_small",
                 "init_type": "fixed",
                 "init_gate_passed": True,
                 "approach_type": "top_down_pregrasp_vertical",

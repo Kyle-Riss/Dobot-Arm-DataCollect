@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FastAPI web server for Dobot E6 Pick-Place data collection.
+FastAPI web server for UFactory xArm Pick-Place data collection.
 Dual camera: HIKRobot (wrist) + ZED (scene, LEFT view only)
 Dashboard: J1-J6, TCP pose, Robot Mode live display
 
 Usage:
-    cd ~/dobot-xarm-datacollect/Dobot_E6_Moveit2/src
+    cd ~/dobot-xarm-datacollect/UFactory/src
     python3 robot_server.py
 
 Open: http://<jetson-ip>:8000
@@ -113,11 +113,11 @@ from pick_place_gui_random_pose import (
 )
 
 # 데이터 저장 경로 — 외장 드라이브 마운트 확인 필요
-DATA_SAVE_DIR      = "/media/billye6/새 볼륨/Dobot/2CAM-Orange"
-DATA_SAVE_DIR_V10  = "/media/billye6/새 볼륨/Dobot/2CAM-Orange-init"   # v10 고정홈 수집 전용
+DATA_SAVE_DIR      = "/media/billye6/새 볼륨/UFactory/2CAM-Orange"
 DATA_DRIVE_ROOT    = "/media/billye6/새 볼륨"   # 마운트 여부 판단 기준
-from dobot_e6_controller import DobotE6Controller
-from suction_gripper import SuctionGripper
+from xarm_controller import XArmController as DobotE6Controller
+from xarm_gripper import XArmGripper
+from waypoint_collector import WaypointCollector
 
 _hik_available = False
 try:
@@ -196,6 +196,7 @@ _ros2_ok: bool = False          # start() 성공 후 True 로 설정
 _state = {
     "robot":          None,
     "gripper":        None,
+    "wc":             None,   # WaypointCollector
     "camera_hik":     None,
     "camera_zed":     None,
     "worker":         None,
@@ -211,7 +212,6 @@ _state = {
     "pick_section":   "A",
     "last_place_x":   None,
     "last_place_y":   None,
-    "collect_mode":   "auto",   # "auto" = 기존 랜덤포즈 | "v10" = 고정 홈포지션 신규수집
     # v20+ 앵커 페어 선택
     "anchor_a_idx":       None,   # None=random, 0/1/2 = A3/A4/A5 고정
     "anchor_b_idx":       None,   # None=random, 0/1/2 = B1/B2/B3 고정
@@ -219,8 +219,6 @@ _state = {
     "pair_counts":        {},     # "AB_a_b" / "BA_b_a" → 성공 에피소드 수
 }
 
-# v10 수집 모드 고정 홈포지션 (joint angles, degrees)
-V10_JOINT_HOME = [91.3, 37.7, 53.8, -1.5, -87.8, 173.3]
 
 _state_lock  = threading.Lock()
 _ORIG_A_ANCHORS: list = []   # base.A_ANCHORS 원본 (startup 시 캡처)
@@ -232,9 +230,8 @@ _main_loop: asyncio.AbstractEventLoop = None
 FIXED_INIT = (89.3715, -378.5400, 250.0000, -179.5275, -2.4369, 2.3663)
 
 ROBOT_MODE_LABELS = {
-    1:"INIT", 2:"BRAKE_OPEN", 4:"DISABLED", 5:"ENABLE",
-    6:"BACKDRIVE", 7:"RUNNING", 8:"RECORDING", 9:"ERROR",
-    10:"PAUSE", 11:"JOG"
+    5:"STANDBY", 7:"RUNNING", 9:"ERROR",
+    10:"PAUSED", 11:"JOG"
 }
 
 # ─── 프레임 버퍼 (MJPEG + 레코딩 공용) ────────────────────────────────────
@@ -423,7 +420,7 @@ def _start_recording():
         return
     # ────────────────────────────────────────────────────────────────────────
 
-    base = DATA_SAVE_DIR_V10 if _state.get("collect_mode") == "v10" else DATA_SAVE_DIR
+    base = DATA_SAVE_DIR
     n = _get_next_folder(base)
     save_dir = os.path.join(base, str(n))
     has_zed = bool(_state["camera_zed"] and _state["camera_zed"].initialized)
@@ -628,8 +625,6 @@ def _on_finished(success: bool):
     _stop_and_save(success)
     if success:
         _update_pair_count(ep_meta_snap)
-    if _state.get("collect_mode") == "v10" and success:
-        success = _check_episode_quality_v10(_qc_data, _qc_dir)
     if w and hasattr(w, 'place_x') and w.place_x is not None:
         _state["last_place_x"] = w.place_x
         _state["last_place_y"] = w.place_y
@@ -757,33 +752,10 @@ def _run_step():
         base.B_ANCHORS = [_ORIG_B_ANCHORS[b_idx]] if (b_idx is not None and 0 <= b_idx < 3) else list(_ORIG_B_ANCHORS)
     # ────────────────────────────────────────────────────────────────────────
 
-    mode = _state.get("collect_mode", "auto")
-
-    if mode == "v10":
-        # v10: joint-space 고정 홈포지션으로 이동 후 수집
-        j = V10_JOINT_HOME
-        _log(f"[v10] 홈포지션 이동 → j3={j[2]}° j4={j[3]}°")
-        ok = robot.move_j(j[0], j[1], j[2], j[3], j[4], j[5],
-                          velocity=25, coordinate_mode=1, use_waypoint=False)
-        if not ok:
-            _log("⚠ [v10] 홈포지션 이동 실패 — 수집 중단"); return
-        robot.wait_for_motion_complete()
-        # 실제 도달한 TCP 좌표를 INIT으로 설정 → step1이 no-op, IK 경유점 오염 방지
-        pose = robot.get_current_pose_from_feedback()
-        if pose and len(pose) >= 6:
-            base.INIT_X, base.INIT_Y, base.INIT_Z   = pose[0], pose[1], pose[2]
-            base.INIT_RX, base.INIT_RY, base.INIT_RZ = pose[3], pose[4], pose[5]
-            _log(f"[v10] INIT TCP 갱신: X={pose[0]:.1f} Y={pose[1]:.1f} Z={pose[2]:.1f}")
-        else:
-            base.INIT_X = FIXED_INIT[0]; base.INIT_Y = FIXED_INIT[1]; base.INIT_Z = FIXED_INIT[2]
-            base.INIT_RX = FIXED_INIT[3]; base.INIT_RY = FIXED_INIT[4]; base.INIT_RZ = FIXED_INIT[5]
-            _log("⚠ [v10] TCP 피드백 실패 — FIXED_INIT 사용")
-    else:
-        _set_random_init_pose(robot)
+    _set_random_init_pose(robot)
 
     cam_hik = _state["camera_hik"] if (_state["camera_hik"] and
                                         _state["camera_hik"].initialized) else None
-    vel_scale = 2.0 if mode == "v10" else 1.0
     worker = RandomPosePickPlaceStepWorker(
         robot, gripper,
         pick_section   = _state["pick_section"],
@@ -791,7 +763,7 @@ def _run_step():
         pick_y         = _state["last_place_y"],
         camera         = cam_hik,
         fallback_initial_pose = FIXED_INIT,
-        velocity_scale = vel_scale,
+        velocity_scale = 1.0,
     )
     worker.log_signal.connect(_on_log)
     worker.finished.connect(_on_finished)
@@ -804,7 +776,7 @@ def _run_step():
 # ═══════════════════════════════════════════════════════════════════════════
 # FastAPI
 # ═══════════════════════════════════════════════════════════════════════════
-app = FastAPI(title="Dobot E6 Server")
+app = FastAPI(title="UFactory xArm Server")
 
 @app.on_event("startup")
 async def _startup():
@@ -844,7 +816,7 @@ async def _broadcast():
 # ─── 연결 ────────────────────────────────────────────────────────────────
 
 @app.post("/connect")
-def connect(ip: str = "192.168.5.1"):
+def connect(ip: str = "192.168.1.225"):
     if _state["robot"] and _state["robot"].connected:
         return {"ok": True, "msg": "Already connected"}
     try:
@@ -852,7 +824,10 @@ def connect(ip: str = "192.168.5.1"):
         if not robot.connect():
             return JSONResponse({"ok": False, "msg": "Connect failed — robot unreachable"}, status_code=500)
         _state["robot"]   = robot
-        _state["gripper"] = SuctionGripper(robot, do_index=1)
+        _state["gripper"] = XArmGripper(robot._arm)
+        wc = WaypointCollector(robot, _state["gripper"])
+        wc._log_cb = _log
+        _state["wc"] = wc
         _log(f"Robot connected @ {ip}")
         return {"ok": True, "msg": f"Connected @ {ip}"}
     except Exception as e:
@@ -937,6 +912,13 @@ def status():
                 robot_mode = int(feed['RobotMode'][0]) if 'RobotMode' in feed.dtype.names else 0
         except Exception:
             pass
+    gripper     = _state["gripper"]
+    gripper_pos = None
+    if gripper:
+        try:
+            gripper_pos = gripper.get_position()
+        except Exception:
+            pass
     return {
         "connected":      connected,
         "pose":           pose,
@@ -950,17 +932,8 @@ def status():
         "auto_target":    _state["auto_target"],
         "auto_done":      _state["auto_done"],
         "worker_running": bool(_state["worker"] and _state["worker"].isRunning()),
-        "collect_mode":   _state.get("collect_mode", "auto"),
+        "gripper_pos":    round(gripper_pos, 1) if gripper_pos is not None else None,
     }
-
-@app.post("/collect-mode")
-def set_collect_mode(mode: str):
-    if mode not in ("auto", "v10"):
-        return JSONResponse({"ok": False, "msg": "mode must be 'auto' or 'v10'"}, status_code=400)
-    _state["collect_mode"] = mode
-    label = "기존 랜덤포즈" if mode == "auto" else "v10 고정홈포지션"
-    _log(f"수집 모드 변경: {mode} ({label})")
-    return {"ok": True, "msg": f"모드: {label}"}
 
 @app.post("/anchor")
 def set_anchor(direction: str = "auto", a_idx: int = -1, b_idx: int = -1):
@@ -1111,10 +1084,176 @@ def release():
     threading.Thread(target=g.release, daemon=True).start()
     return {"ok": True}
 
+@app.post("/gripper/set")
+def gripper_set(pos: int, speed: int = 60, force: int = 50):
+    """슬라이더 Set 버튼 — 지정 위치로 이동."""
+    g = _state["gripper"]
+    if not g: return JSONResponse({"ok": False, "msg": "No gripper"}, status_code=400)
+    pos = max(0, min(85, pos))
+    threading.Thread(target=g.set_position, args=(pos,), kwargs={"speed": speed, "force": force}, daemon=True).start()
+    return {"ok": True, "msg": f"Gripper → {pos}mm"}
+
+@app.post("/gripper/jog")
+def gripper_jog(direction: str = "close"):
+    """V=close / C=open: 목표까지 천천히 이동 시작 (wait=False)."""
+    g = _state["gripper"]
+    if not g: return JSONResponse({"ok": False, "msg": "No gripper"}, status_code=400)
+    target = 0 if direction == "close" else 85
+    threading.Thread(target=g.set_position, args=(target,),
+                     kwargs={"speed": 20, "force": 50, "wait": False}, daemon=True).start()
+    return {"ok": True}
+
+@app.post("/gripper/jog/stop")
+def gripper_jog_stop():
+    """키 떼는 순간 현재 위치에서 정지."""
+    g = _state["gripper"]
+    if not g: return JSONResponse({"ok": False, "msg": "No gripper"}, status_code=400)
+    def _hold():
+        pos = g.get_position()
+        if pos is not None:
+            g.set_position(int(round(pos)), speed=100, force=50)
+    threading.Thread(target=_hold, daemon=True).start()
+    return {"ok": True}
+
+# ─── Manual Recording ────────────────────────────────────────────────────────
+
+@app.post("/record/start")
+def record_start():
+    if _state["recording"]:
+        return JSONResponse({"ok": False, "msg": "Already recording"}, status_code=400)
+    if not _state["robot"] or not _state["robot"].connected:
+        return JSONResponse({"ok": False, "msg": "Not connected"}, status_code=400)
+    _start_recording()
+    _log("Manual recording started")
+    return {"ok": True, "msg": "Recording started"}
+
+@app.post("/record/stop")
+def record_stop(success: bool = True):
+    if not _state["recording"]:
+        return JSONResponse({"ok": False, "msg": "Not recording"}, status_code=400)
+    _stop_and_save(success)
+    msg = f"Saved ({_state.get('record_frame_count',0)} frames)" if success else "Discarded"
+    _log(f"Manual recording stopped — {msg}")
+    return {"ok": True, "msg": msg}
+
+# ─── Waypoint Collector ──────────────────────────────────────────────────────
+
+def _wc_check():
+    wc = _state.get("wc")
+    if not wc: return None, JSONResponse({"ok": False, "msg": "Not connected"}, status_code=400)
+    return wc, None
+
+@app.get("/wc/status")
+def wc_status():
+    wc, err = _wc_check()
+    if err: return err
+    return {"ok": True, **wc.status}
+
+@app.post("/wc/home/capture")
+def wc_capture_home():
+    wc, err = _wc_check()
+    if err: return err
+    ok = wc.capture_home()
+    return {"ok": ok, "home_joints": wc.home_joints}
+
+@app.post("/wc/home/speed")
+def wc_home_speed(speed: float = 25.0):
+    wc, err = _wc_check()
+    if err: return err
+    wc.home_speed = max(5.0, min(80.0, speed))
+    wc.save()
+    return {"ok": True, "home_speed": wc.home_speed}
+
+@app.post("/wc/waypoint/capture")
+def wc_capture_wp(name: str, noise: bool = False,
+                  gripper: str = "", speed: float = 40.0):
+    wc, err = _wc_check()
+    if err: return err
+    g = gripper if gripper in ("grip", "release") else None
+    ok = wc.capture_waypoint(name, noise=noise, gripper=g, speed=speed)
+    return {"ok": ok, "waypoints": wc.waypoints}
+
+@app.post("/wc/waypoint/delete")
+def wc_delete_wp(name: str):
+    wc, err = _wc_check()
+    if err: return err
+    ok = wc.delete_waypoint(name)
+    return {"ok": ok, "waypoints": wc.waypoints}
+
+@app.post("/wc/waypoint/goto")
+def wc_goto_wp(name: str):
+    wc, err = _wc_check()
+    if err: return err
+    def _do(): wc.goto_waypoint_by_name(name)
+    threading.Thread(target=_do, daemon=True).start()
+    return {"ok": True}
+
+@app.post("/wc/waypoint/update")
+def wc_update_wp(name: str, noise: bool = False,
+                 gripper: str = "", speed: float = 40.0):
+    """noise/gripper/speed 만 업데이트 (위치 유지)."""
+    wc, err = _wc_check()
+    if err: return err
+    g = gripper if gripper in ("grip", "release") else None
+    for wp in wc.waypoints:
+        if wp["name"] == name:
+            wp["noise"]   = noise
+            wp["gripper"] = g
+            wp["speed"]   = speed
+            wc.save()
+            return {"ok": True, "waypoints": wc.waypoints}
+    return JSONResponse({"ok": False, "msg": f"{name} not found"}, status_code=404)
+
+@app.post("/wc/noise")
+def wc_set_noise(xy_mm: float = 10.0, z_mm: float = 3.0):
+    wc, err = _wc_check()
+    if err: return err
+    wc.noise_xy_mm = max(0.0, min(50.0, xy_mm))
+    wc.noise_z_mm  = max(0.0, min(20.0, z_mm))
+    wc.save()
+    return {"ok": True, "noise_xy_mm": wc.noise_xy_mm, "noise_z_mm": wc.noise_z_mm}
+
+@app.post("/wc/collect/step")
+def wc_step():
+    wc, err = _wc_check()
+    if err: return err
+    if wc._running:
+        return JSONResponse({"ok": False, "msg": "Already running"}, status_code=400)
+    def _do():
+        wc.run_episode(
+            rec_start_cb=_start_recording,
+            rec_stop_cb=_stop_and_save
+        )
+    threading.Thread(target=_do, daemon=True).start()
+    return {"ok": True}
+
+@app.post("/wc/collect/auto")
+def wc_auto(n: int = 10):
+    wc, err = _wc_check()
+    if err: return err
+    if wc._running:
+        return JSONResponse({"ok": False, "msg": "Already running"}, status_code=400)
+    wc.run_auto(
+        n=n,
+        rec_start_cb=_start_recording,
+        rec_stop_cb=_stop_and_save,
+        done_cb=lambda done, total: _log(f"WC Auto 완료: {done}/{total}")
+    )
+    return {"ok": True}
+
+@app.post("/wc/collect/stop")
+def wc_stop():
+    wc, err = _wc_check()
+    if err: return err
+    wc.stop()
+    return {"ok": True}
+
 @app.post("/estop")
 def estop():
     w = _state["worker"]
     if w: w._stop_requested = True
+    wc = _state.get("wc")
+    if wc: wc.stop()
     if _state["gripper"]:
         try: _state["gripper"].emergency_release()
         except Exception: pass
@@ -1255,128 +1394,217 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dobot E6 Server</title>
+<title>UFactory xArm</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#12121f;color:#dde;font-size:13px;min-width:900px}
-h1{text-align:center;padding:9px;background:#0e0e1d;color:#00c8e8;font-size:1.05rem;letter-spacing:1px;border-bottom:1px solid #1e2a3a}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d0d0d;color:#e5e5e5;font-size:13px;min-width:960px}
 
-/* 3-column layout */
-.layout{display:grid;grid-template-columns:300px 1fr 340px;gap:8px;padding:8px;align-items:start}
+/* ── TOP HEADER ─────────────────────────────────────────────────────────── */
+#topbar{
+  position:sticky;top:0;z-index:100;
+  height:52px;background:#111;border-bottom:1px solid #2a2a2a;
+  display:flex;align-items:center;padding:0 14px;gap:12px;
+}
+#topbar .brand{display:flex;align-items:center;gap:8px;min-width:160px}
+#topbar .brand-icon{width:26px;height:26px;background:#FF6B00;border-radius:5px;
+  display:flex;align-items:center;justify-content:center;font-weight:900;font-size:13px;color:#000}
+#topbar .brand-name{font-size:.85rem;font-weight:700;letter-spacing:.5px;color:#fff}
+#topbar .brand-sub{font-size:.65rem;color:#555;margin-top:1px}
+
+#status-badge{
+  display:flex;align-items:center;gap:6px;padding:4px 10px;
+  background:#1a1a1a;border:1px solid #2a2a2a;border-radius:20px;
+  font-size:.72rem;font-weight:600;white-space:nowrap;
+}
+.badge-dot{width:8px;height:8px;border-radius:50%;background:#333}
+.badge-dot.standby{background:#22C55E}
+.badge-dot.running{background:#FF6B00;animation:pulse .8s infinite}
+.badge-dot.error{background:#EF4444;animation:pulse .5s infinite}
+.badge-dot.off{background:#444}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+#mini-joints{
+  display:flex;gap:6px;align-items:center;flex:1;
+  overflow:hidden;
+}
+.mj{display:flex;flex-direction:column;align-items:center;
+  background:#1a1a1a;border:1px solid #222;border-radius:5px;
+  padding:3px 7px;min-width:52px}
+.mj-label{font-size:.53rem;color:#555;text-transform:uppercase}
+.mj-val{font-size:.75rem;font-weight:700;color:#FF6B00;font-family:monospace}
+
+#topbar-right{display:flex;align-items:center;gap:8px;margin-left:auto}
+#rec-indicator{display:none;align-items:center;gap:5px;
+  background:#1a0000;border:1px solid #5a0000;border-radius:4px;
+  padding:3px 9px;font-size:.7rem;color:#ff4444;font-weight:700}
+#rec-indicator .rdot{width:7px;height:7px;border-radius:50%;background:#EF4444;animation:pulse .8s infinite}
+#estop-btn{
+  background:#1a0000;border:2px solid #EF4444;color:#EF4444;
+  padding:6px 14px;border-radius:5px;cursor:pointer;font-size:.8rem;font-weight:800;
+  letter-spacing:.5px;transition:all .15s;white-space:nowrap;
+}
+#estop-btn:hover{background:#EF4444;color:#fff}
+
+/* ── LAYOUT ─────────────────────────────────────────────────────────────── */
+.layout{display:grid;grid-template-columns:290px 1fr 320px;gap:8px;padding:8px;align-items:start}
 .col{display:flex;flex-direction:column;gap:8px;min-width:0}
 
-/* card */
-.card{background:#1a1a30;border-radius:7px;padding:11px;overflow:hidden}
-h3{color:#00c8e8;font-size:.7rem;text-transform:uppercase;letter-spacing:.6px;margin-bottom:9px;border-bottom:1px solid #1e2a3a;padding-bottom:5px}
+/* ── CARD ────────────────────────────────────────────────────────────────── */
+.card{background:#161616;border:1px solid #222;border-radius:8px;padding:12px;overflow:hidden}
+h3{
+  font-size:.68rem;text-transform:uppercase;letter-spacing:.8px;
+  color:#e5e5e5;margin-bottom:10px;padding-bottom:6px;
+  border-bottom:1px solid #222;
+  display:flex;align-items:center;gap:6px;
+}
+h3::before{content:'';display:inline-block;width:3px;height:12px;background:#FF6B00;border-radius:2px}
 
-/* row, inputs, buttons */
+/* ── INPUTS / BUTTONS ────────────────────────────────────────────────────── */
 .row{display:flex;gap:5px;margin-bottom:6px;align-items:center;flex-wrap:wrap}
-input[type=text],input[type=number]{background:#0d1a2e;color:#dde;border:1px solid #2a4a6a;
-  padding:4px 7px;border-radius:4px;flex:1;min-width:0;font-size:.8rem}
-button{background:#0d1a2e;color:#aac8e0;border:1px solid #2a4a6a;padding:5px 10px;
-  border-radius:4px;cursor:pointer;font-size:.78rem;white-space:nowrap;transition:background .12s}
-button:hover{background:#00c8e8;color:#0d1a2e;border-color:#00c8e8}
-button:active{filter:brightness(1.3)}
-.btn-g{border-color:#2dc653;color:#2dc653}.btn-g:hover{background:#2dc653;color:#0d1a2e}
-.btn-r{border-color:#e63946;color:#e63946}.btn-r:hover{background:#e63946;color:#fff}
-.btn-y{border-color:#f4a261;color:#f4a261}.btn-y:hover{background:#f4a261;color:#0d1a2e}
+input[type=text],input[type=number]{
+  background:#0d0d0d;color:#e5e5e5;border:1px solid #333;
+  padding:5px 8px;border-radius:5px;flex:1;min-width:0;font-size:.8rem;
+  transition:border-color .15s;
+}
+input[type=text]:focus,input[type=number]:focus{outline:none;border-color:#FF6B00}
+button{
+  background:#0d0d0d;color:#aaa;border:1px solid #333;padding:5px 10px;
+  border-radius:5px;cursor:pointer;font-size:.76rem;white-space:nowrap;transition:all .12s;
+}
+button:hover{background:#FF6B00;color:#000;border-color:#FF6B00}
+button:active{filter:brightness(1.2)}
+.btn-g{border-color:#22C55E;color:#22C55E}.btn-g:hover{background:#22C55E;color:#000;border-color:#22C55E}
+.btn-r{border-color:#EF4444;color:#EF4444}.btn-r:hover{background:#EF4444;color:#fff;border-color:#EF4444}
+.btn-y{border-color:#F59E0B;color:#F59E0B}.btn-y:hover{background:#F59E0B;color:#000;border-color:#F59E0B}
+.btn-o{border-color:#FF6B00;color:#FF6B00}.btn-o:hover{background:#FF6B00;color:#000}
 
-/* status bars */
-.sbar{background:#0d1a2e;padding:5px 9px;border-radius:4px;font-size:.72rem;margin-bottom:5px}
+/* ── STATUS BARS ─────────────────────────────────────────────────────────── */
+.sbar{background:#0d0d0d;border:1px solid #222;padding:5px 9px;border-radius:5px;font-size:.71rem;margin-bottom:5px;color:#aaa}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:middle}
-.on{background:#2dc653}.off{background:#e63946}.rec{background:#e63946;animation:blink 1s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.on{background:#22C55E}.off{background:#555}.rec{background:#EF4444;animation:pulse .8s infinite}
 
-/* dashboard grid */
+/* ── DASHBOARD GRID ──────────────────────────────────────────────────────── */
 .dash-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
-.dash-cell{background:#0d1a2e;border-radius:4px;padding:5px 4px;text-align:center}
-.dash-label{font-size:.58rem;color:#557;text-transform:uppercase}
-.dash-val{font-size:.88rem;font-weight:700;color:#00c8e8;font-family:monospace}
+.dash-cell{background:#0d0d0d;border:1px solid #1e1e1e;border-radius:5px;padding:6px 4px;text-align:center}
+.dash-label{font-size:.57rem;color:#444;text-transform:uppercase;letter-spacing:.4px}
+.dash-val{font-size:.9rem;font-weight:700;color:#FF6B00;font-family:'Courier New',monospace;margin-top:2px}
 
-/* cameras */
-.cam-row{display:grid;grid-template-columns:1fr 1fr;gap:4px}
-.cam-box{background:#0d1a2e;border-radius:5px;overflow:hidden}
-.cam-label{font-size:.63rem;color:#446;padding:3px 6px;background:#0a0f1e}
-img.stream{width:100%;height:480px;object-fit:contain;display:block;background:#000}
+/* ── CAMERA ──────────────────────────────────────────────────────────────── */
+.cam-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.cam-box{background:#0d0d0d;border:1px solid #222;border-radius:6px;overflow:hidden}
+.cam-label{font-size:.62rem;color:#555;padding:4px 8px;background:#111;border-bottom:1px solid #1a1a1a;letter-spacing:.3px}
+img.stream{width:100%;height:460px;object-fit:contain;display:block;background:#050505}
 
-/* log */
-#log{background:#060612;font-family:monospace;font-size:.67rem;height:140px;overflow-y:auto;
-  padding:6px;border-radius:4px;color:#6fdf8f;word-break:break-all}
+/* ── LOG ─────────────────────────────────────────────────────────────────── */
+#log{background:#080808;font-family:'Courier New',monospace;font-size:.66rem;
+  height:130px;overflow-y:auto;padding:6px 8px;border-radius:5px;
+  color:#22C55E;word-break:break-all;border:1px solid #1a1a1a}
 
-/* separator */
-.sep{border-top:1px solid #1e2a3a;margin:8px 0}
-.sub{font-size:.63rem;color:#557;margin-bottom:5px;margin-top:2px}
+/* ── SEPARATOR / SUB ─────────────────────────────────────────────────────── */
+.sep{border-top:1px solid #1e1e1e;margin:8px 0}
+.sub{font-size:.62rem;color:#444;margin-bottom:4px;margin-top:3px;letter-spacing:.2px}
 
-/* ── JOG ── */
-/* D-pad: 3×3 grid */
-.dpad{display:grid;grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,40px);gap:4px}
-.dpad .jb{font-size:.9rem;font-weight:700;padding:0;display:flex;align-items:center;justify-content:center;
-  border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
-.dpad .jb.center{background:#1e2a3a;color:#446;font-size:.6rem;cursor:default;border:1px solid #1e2a3a}
-.dpad .jb.center:hover{background:#1e2a3a;color:#446;border-color:#1e2a3a}
-
-/* Z col */
+/* ── JOG ─────────────────────────────────────────────────────────────────── */
+.dpad{display:grid;grid-template-columns:repeat(3,50px);grid-template-rows:repeat(3,38px);gap:4px}
+.dpad .jb{font-size:.85rem;font-weight:700;padding:0;display:flex;align-items:center;justify-content:center;
+  border-radius:6px;user-select:none;-webkit-user-select:none;touch-action:none}
+.dpad .jb.center{background:#1a1a1a;color:#333;font-size:.58rem;cursor:default;border:1px solid #1e1e1e}
+.dpad .jb.center:hover{background:#1a1a1a;color:#333;border-color:#1e1e1e}
 .zcol{display:flex;flex-direction:column;gap:4px;margin-left:8px}
-.zcol .jb{width:48px;height:40px;font-size:.85rem;font-weight:700;display:flex;align-items:center;
-  justify-content:center;border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
-
-/* rotation row */
+.zcol .jb{width:46px;height:38px;font-size:.82rem;font-weight:700;display:flex;align-items:center;
+  justify-content:center;border-radius:6px;user-select:none;-webkit-user-select:none;touch-action:none}
 .rot-row{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
-.rot-row .jb{padding:5px 2px;font-size:.72rem;text-align:center;font-weight:600;
-  border-radius:4px;user-select:none;-webkit-user-select:none;touch-action:none}
-
-/* joint row */
+.rot-row .jb{padding:5px 2px;font-size:.7rem;text-align:center;font-weight:600;
+  border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
 .joint-table{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
-.joint-table .jb{padding:6px 2px;font-size:.72rem;text-align:center;
-  border-radius:4px;user-select:none;-webkit-user-select:none;touch-action:none}
+.joint-table .jb{padding:6px 2px;font-size:.7rem;text-align:center;
+  border-radius:5px;user-select:none;-webkit-user-select:none;touch-action:none}
+.jb.jogging{background:#FF6B00 !important;color:#000 !important;border-color:#FF6B00 !important}
+input[type=range]{width:100%;accent-color:#FF6B00}
 
-/* active jog highlight */
-.jb.jogging{background:#00c8e8 !important;color:#0d1a2e !important;border-color:#00c8e8 !important}
+/* ── POSE DISPLAY ────────────────────────────────────────────────────────── */
+#pose-display{font-size:.67rem;color:#FF6B00;margin-top:4px;font-family:'Courier New',monospace;
+  word-break:break-all;min-height:16px;background:#0d0d0d;border:1px solid #1e1e1e;
+  border-radius:4px;padding:4px 7px}
 
-/* speed slider */
-input[type=range]{width:100%;accent-color:#00c8e8}
+/* ── ANCHOR TABLE ────────────────────────────────────────────────────────── */
+.pc{text-align:center;padding:2px 4px;background:#0d0d0d;border-radius:3px;
+  font-family:'Courier New',monospace;color:#555;border:1px solid #1e1e1e}
+.pc.has-data{color:#FF6B00;font-weight:700;border-color:#FF6B00;background:#1a0e00}
+.anc-active{background:#1a0e00 !important;border-color:#FF6B00 !important;color:#FF6B00 !important}
 
-/* pose capture */
-#pose-display{font-size:.68rem;color:#9cf;margin-top:4px;font-family:monospace;word-break:break-all;min-height:16px}
-
-/* anchor pair table cells */
-.pc{text-align:center;padding:2px 4px;background:#0d1a2e;border-radius:3px;font-family:monospace;color:#9cf}
-.pc.has-data{color:#2dc653;font-weight:700}
-/* anchor selector button active */
-.anc-active{background:#0d3a2e !important;border-color:#00c8a0 !important;color:#00c8a0 !important}
+/* ── GRIPPER BUTTONS ─────────────────────────────────────────────────────── */
+.grip-row{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.grip-btn{padding:10px;font-size:.8rem;font-weight:700;border-radius:6px;
+  cursor:pointer;transition:all .15s;user-select:none;text-align:center}
+.grip-on{background:#1a0e00;border:2px solid #FF6B00;color:#FF6B00}
+.grip-on:hover{background:#FF6B00;color:#000}
+.grip-off{background:#0d0d0d;border:2px solid #333;color:#888}
+.grip-off:hover{background:#333;color:#fff}
 </style>
 </head>
 <body>
-<h1>⬡ Dobot E6 — Robot Control &amp; Data Collection</h1>
+
+<!-- ═══════════════ TOP HEADER ═══════════════ -->
+<div id="topbar">
+  <div class="brand">
+    <div class="brand-icon">X</div>
+    <div>
+      <div class="brand-name">UFACTORY</div>
+      <div class="brand-sub">xArm6 Control Server</div>
+    </div>
+  </div>
+
+  <div id="status-badge">
+    <span class="badge-dot off" id="badge-dot"></span>
+    <span id="badge-text">OFFLINE</span>
+  </div>
+
+  <div id="mini-joints">
+    <div class="mj"><div class="mj-label">J1</div><div class="mj-val" id="hJ1">—</div></div>
+    <div class="mj"><div class="mj-label">J2</div><div class="mj-val" id="hJ2">—</div></div>
+    <div class="mj"><div class="mj-label">J3</div><div class="mj-val" id="hJ3">—</div></div>
+    <div class="mj"><div class="mj-label">J4</div><div class="mj-val" id="hJ4">—</div></div>
+    <div class="mj"><div class="mj-label">J5</div><div class="mj-val" id="hJ5">—</div></div>
+    <div class="mj"><div class="mj-label">J6</div><div class="mj-val" id="hJ6">—</div></div>
+  </div>
+
+  <div id="topbar-right">
+    <div id="rec-indicator"><span class="rdot"></span>REC</div>
+    <button id="estop-btn" onclick="doEstop()">⚠ E-STOP</button>
+  </div>
+</div>
+
+<!-- ═══════════════ MAIN LAYOUT ═══════════════ -->
 <div class="layout">
 
-<!-- ══════════════ LEFT COL ══════════════ -->
+<!-- ══════ LEFT COL ══════ -->
 <div class="col">
 
   <!-- Connection -->
   <div class="card">
     <h3>Connection</h3>
     <div class="row">
-      <input id="ip" type="text" value="192.168.5.1" style="max-width:115px">
+      <input id="ip" type="text" value="192.168.1.225" style="max-width:125px">
       <button class="btn-g" onclick="api('POST','/connect',{ip:$('ip').value})">Connect</button>
       <button onclick="api('POST','/disconnect')">Disconnect</button>
     </div>
     <div id="conn-bar" class="sbar"><span class="dot off"></span>Disconnected</div>
-    <div id="mode-bar" class="sbar" style="margin-bottom:7px">Mode: —</div>
-    <div class="row" style="margin-bottom:0;gap:4px">
+    <div id="mode-bar" class="sbar" style="margin-bottom:7px">State: —</div>
+    <div class="row" style="margin-bottom:0;gap:4px;flex-wrap:wrap">
       <button class="btn-g" onclick="api('POST','/enable')">Enable</button>
       <button onclick="api('POST','/disable')">Disable</button>
-      <button class="btn-y" onclick="clearAlarm()">Clear Alarm</button>
+      <button class="btn-y" onclick="clearAlarm()">Clear Error</button>
       <button class="btn-y" onclick="api('POST','/resume').then(()=>addLog('▶ Resume sent'))">Resume</button>
       <button onclick="api('POST','/home')">Home</button>
     </div>
   </div>
 
-  <!-- Dashboard -->
+  <!-- TCP Pose -->
   <div class="card">
-    <h3>Robot Dashboard</h3>
-    <div class="sub">TCP Pose (mm / deg)</div>
-    <div class="dash-grid">
+    <h3>TCP Pose &amp; Joints</h3>
+    <div class="sub">Position (mm) / Orientation (deg)</div>
+    <div class="dash-grid" style="margin-bottom:6px">
       <div class="dash-cell"><div class="dash-label">X</div><div class="dash-val" id="dX">—</div></div>
       <div class="dash-cell"><div class="dash-label">Y</div><div class="dash-val" id="dY">—</div></div>
       <div class="dash-cell"><div class="dash-label">Z</div><div class="dash-val" id="dZ">—</div></div>
@@ -1384,7 +1612,7 @@ input[type=range]{width:100%;accent-color:#00c8e8}
       <div class="dash-cell"><div class="dash-label">RY</div><div class="dash-val" id="dRY">—</div></div>
       <div class="dash-cell"><div class="dash-label">RZ</div><div class="dash-val" id="dRZ">—</div></div>
     </div>
-    <div class="sub" style="margin-top:8px">Joint Angles (deg)</div>
+    <div class="sub">Joint Angles (deg)</div>
     <div class="dash-grid">
       <div class="dash-cell"><div class="dash-label">J1</div><div class="dash-val" id="dJ1">—</div></div>
       <div class="dash-cell"><div class="dash-label">J2</div><div class="dash-val" id="dJ2">—</div></div>
@@ -1399,152 +1627,212 @@ input[type=range]{width:100%;accent-color:#00c8e8}
   <div class="card">
     <h3>Data Collection</h3>
 
-    <!-- 수집 모드 선택 -->
-    <div class="sub">수집 모드</div>
-    <div class="row" style="margin-bottom:8px">
-      <button id="mode-btn-auto" class="btn-g" style="flex:1;padding:7px;font-size:.8rem"
-        onclick="setCollectMode('auto')">① 기존 (랜덤포즈)</button>
-      <button id="mode-btn-v10" style="flex:1;padding:7px;font-size:.8rem;border-color:#a78bfa;color:#a78bfa"
-        onclick="setCollectMode('v10')">② 신규 v10 (고정홈)</button>
-    </div>
-    <div id="mode-display" class="sbar" style="margin-bottom:8px;font-size:.72rem">모드: —</div>
-
-    <div class="sep"></div>
-    <!-- ── 앵커 페어 선택 (v20+) ── -->
-    <div class="sub">앵커 페어 선택 (v20+)</div>
-
-    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">방향 고정</div>
+    <div class="sub">앵커 페어 (v20+)</div>
+    <div class="sub" style="font-size:.59rem;color:#333;margin-bottom:3px">방향</div>
     <div class="row" style="margin-bottom:5px">
-      <button id="dir-A"    onclick="anchorSetDir('A')"    style="flex:1;padding:5px;font-size:.74rem">A→B</button>
-      <button id="dir-B"    onclick="anchorSetDir('B')"    style="flex:1;padding:5px;font-size:.74rem">B→A</button>
-      <button id="dir-auto" onclick="anchorSetDir('auto')" style="flex:1;padding:5px;font-size:.74rem">Auto</button>
+      <button id="dir-A"    onclick="anchorSetDir('A')"    style="flex:1;padding:4px;font-size:.72rem">A→B</button>
+      <button id="dir-B"    onclick="anchorSetDir('B')"    style="flex:1;padding:4px;font-size:.72rem">B→A</button>
+      <button id="dir-auto" onclick="anchorSetDir('auto')" style="flex:1;padding:4px;font-size:.72rem">Auto</button>
     </div>
 
-    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">A앵커 (A3/A4/A5)</div>
+    <div class="sub" style="font-size:.59rem;color:#333;margin-bottom:3px">A앵커</div>
     <div class="row" style="margin-bottom:5px">
-      <button id="aa-rand" onclick="anchorSetA(-1)" style="flex:1;padding:4px;font-size:.72rem">랜덤</button>
-      <button id="aa-0"    onclick="anchorSetA(0)"  style="flex:1;padding:4px;font-size:.72rem">A3</button>
-      <button id="aa-1"    onclick="anchorSetA(1)"  style="flex:1;padding:4px;font-size:.72rem">A4</button>
-      <button id="aa-2"    onclick="anchorSetA(2)"  style="flex:1;padding:4px;font-size:.72rem">A5</button>
+      <button id="aa-rand" onclick="anchorSetA(-1)" style="flex:1;padding:3px;font-size:.71rem">랜덤</button>
+      <button id="aa-0"    onclick="anchorSetA(0)"  style="flex:1;padding:3px;font-size:.71rem">A3</button>
+      <button id="aa-1"    onclick="anchorSetA(1)"  style="flex:1;padding:3px;font-size:.71rem">A4</button>
+      <button id="aa-2"    onclick="anchorSetA(2)"  style="flex:1;padding:3px;font-size:.71rem">A5</button>
     </div>
 
-    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:3px">B앵커 (B1/B2/B3)</div>
+    <div class="sub" style="font-size:.59rem;color:#333;margin-bottom:3px">B앵커</div>
     <div class="row" style="margin-bottom:5px">
-      <button id="ba-rand" onclick="anchorSetB(-1)" style="flex:1;padding:4px;font-size:.72rem">랜덤</button>
-      <button id="ba-0"    onclick="anchorSetB(0)"  style="flex:1;padding:4px;font-size:.72rem">B1</button>
-      <button id="ba-1"    onclick="anchorSetB(1)"  style="flex:1;padding:4px;font-size:.72rem">B2</button>
-      <button id="ba-2"    onclick="anchorSetB(2)"  style="flex:1;padding:4px;font-size:.72rem">B3</button>
+      <button id="ba-rand" onclick="anchorSetB(-1)" style="flex:1;padding:3px;font-size:.71rem">랜덤</button>
+      <button id="ba-0"    onclick="anchorSetB(0)"  style="flex:1;padding:3px;font-size:.71rem">B1</button>
+      <button id="ba-1"    onclick="anchorSetB(1)"  style="flex:1;padding:3px;font-size:.71rem">B2</button>
+      <button id="ba-2"    onclick="anchorSetB(2)"  style="flex:1;padding:3px;font-size:.71rem">B3</button>
     </div>
 
     <div id="anchor-display" class="sbar" style="margin-bottom:6px;font-size:.7rem">앵커: —</div>
 
-    <!-- A→B 진행 현황 -->
-    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:2px">A→B 진행 현황</div>
-    <table style="width:100%;border-collapse:collapse;font-size:.65rem;margin-bottom:5px">
+    <div class="sub" style="font-size:.59rem;color:#333;margin-bottom:2px">A→B 진행 현황</div>
+    <table style="width:100%;border-collapse:separate;border-spacing:2px;font-size:.63rem;margin-bottom:5px">
       <tr>
-        <td style="color:#557;padding:2px 3px;width:26px"></td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B1</td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B2</td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">B3</td>
+        <td style="color:#333;width:22px"></td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">B1</td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">B2</td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">B3</td>
       </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A3</td>
+      <tr><td style="color:#FF6B00;font-weight:700">A3</td>
         <td><div id="pl-AB_0_0" class="pc">0</div></td>
         <td><div id="pl-AB_0_1" class="pc">0</div></td>
-        <td><div id="pl-AB_0_2" class="pc">0</div></td>
-      </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A4</td>
+        <td><div id="pl-AB_0_2" class="pc">0</div></td></tr>
+      <tr><td style="color:#FF6B00;font-weight:700">A4</td>
         <td><div id="pl-AB_1_0" class="pc">0</div></td>
         <td><div id="pl-AB_1_1" class="pc">0</div></td>
-        <td><div id="pl-AB_1_2" class="pc">0</div></td>
-      </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">A5</td>
+        <td><div id="pl-AB_1_2" class="pc">0</div></td></tr>
+      <tr><td style="color:#FF6B00;font-weight:700">A5</td>
         <td><div id="pl-AB_2_0" class="pc">0</div></td>
         <td><div id="pl-AB_2_1" class="pc">0</div></td>
-        <td><div id="pl-AB_2_2" class="pc">0</div></td>
-      </tr>
+        <td><div id="pl-AB_2_2" class="pc">0</div></td></tr>
     </table>
 
-    <!-- B→A 진행 현황 -->
-    <div class="sub" style="font-size:.6rem;color:#446;margin-bottom:2px">B→A 진행 현황</div>
-    <table style="width:100%;border-collapse:collapse;font-size:.65rem;margin-bottom:7px">
+    <div class="sub" style="font-size:.59rem;color:#333;margin-bottom:2px">B→A 진행 현황</div>
+    <table style="width:100%;border-collapse:separate;border-spacing:2px;font-size:.63rem;margin-bottom:8px">
       <tr>
-        <td style="color:#557;padding:2px 3px;width:26px"></td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A3</td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A4</td>
-        <td style="color:#00c8e8;text-align:center;padding:2px;font-weight:700">A5</td>
+        <td style="color:#333;width:22px"></td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">A3</td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">A4</td>
+        <td style="color:#FF6B00;text-align:center;font-weight:700">A5</td>
       </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B1</td>
+      <tr><td style="color:#FF6B00;font-weight:700">B1</td>
         <td><div id="pl-BA_0_0" class="pc">0</div></td>
         <td><div id="pl-BA_0_1" class="pc">0</div></td>
-        <td><div id="pl-BA_0_2" class="pc">0</div></td>
-      </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B2</td>
+        <td><div id="pl-BA_0_2" class="pc">0</div></td></tr>
+      <tr><td style="color:#FF6B00;font-weight:700">B2</td>
         <td><div id="pl-BA_1_0" class="pc">0</div></td>
         <td><div id="pl-BA_1_1" class="pc">0</div></td>
-        <td><div id="pl-BA_1_2" class="pc">0</div></td>
-      </tr>
-      <tr>
-        <td style="color:#00c8e8;padding:2px 3px;font-weight:700">B3</td>
+        <td><div id="pl-BA_1_2" class="pc">0</div></td></tr>
+      <tr><td style="color:#FF6B00;font-weight:700">B3</td>
         <td><div id="pl-BA_2_0" class="pc">0</div></td>
         <td><div id="pl-BA_2_1" class="pc">0</div></td>
-        <td><div id="pl-BA_2_2" class="pc">0</div></td>
-      </tr>
+        <td><div id="pl-BA_2_2" class="pc">0</div></td></tr>
     </table>
 
     <div class="sep"></div>
 
+    <!-- 수동 레코딩 -->
+    <div class="sub">수동 레코딩</div>
+    <div id="rec-bar" class="sbar" style="margin-bottom:6px">대기 중</div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="rec-start-btn" class="btn-r" style="flex:1;padding:7px;font-size:.78rem;font-weight:700"
+        onclick="recStart()">● REC Start</button>
+      <button id="rec-save-btn" class="btn-g" style="flex:1;padding:7px;font-size:.78rem" disabled
+        onclick="recStop(true)">■ Save</button>
+      <button id="rec-disc-btn" style="flex:1;padding:7px;font-size:.78rem;border-color:#555;color:#666" disabled
+        onclick="recStop(false)">✕ Discard</button>
+    </div>
+
+    <div class="sep"></div>
+
+    <!-- 자동 Pick-Place -->
+    <div class="sub">자동 Pick-Place</div>
     <div id="auto-bar" class="sbar">Ready</div>
-    <div class="row">
-      <button class="btn-g" onclick="api('POST','/pick-place/step')">▶ Step</button>
-      <input id="auto-n" type="number" value="10" min="1" style="max-width:55px">
-      <button class="btn-g" onclick="autoCollect()">▶ Auto (n)</button>
+    <div class="row" style="margin-bottom:5px">
+      <button class="btn-g" onclick="api('POST','/pick-place/step')" style="flex:1">▶ Step</button>
+      <input id="auto-n" type="number" value="10" min="1" style="max-width:52px">
+      <button class="btn-g" onclick="autoCollect()" style="flex:1">▶ Auto(n)</button>
       <button class="btn-y" onclick="api('POST','/pick-place/stop')">■ Stop</button>
     </div>
-    <button class="btn-r" style="width:100%;padding:8px;font-size:.82rem;font-weight:700" onclick="doEstop()">⚠ E-STOP</button>
+  </div>
+
+  <!-- Waypoint Collector -->
+  <div class="card">
+    <h3>Waypoint Collector</h3>
+
+    <!-- Home -->
+    <div style="background:#0d0d0d;border:1px solid #222;border-radius:5px;padding:7px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+        <span style="font-size:.7rem;color:#aaa;font-weight:600">Home (Joint·고정)</span>
+        <span id="wc-home-status" style="font-size:.65rem;color:#555">미설정</span>
+      </div>
+      <div class="row" style="margin-bottom:4px">
+        <button class="btn-g" style="flex:1" onclick="wcCaptureHome()">📍 Home 캡처</button>
+        <button onclick="api('POST','/wc/waypoint/goto',{name:'__home__'}).then(()=>wcRefresh())"
+          style="flex:1" id="wc-goto-home-btn" disabled>→ Home</button>
+      </div>
+      <div style="display:flex;gap:5px;align-items:center">
+        <span style="font-size:.65rem;color:#555">속도</span>
+        <input type="range" min="5" max="60" value="25" id="wc-home-speed"
+               style="flex:1;accent-color:#FF6B00"
+               oninput="$('wc-home-spd-val').textContent=this.value">
+        <span id="wc-home-spd-val" style="font-size:.65rem;color:#FF6B00;min-width:22px">25</span>
+        <button onclick="api('POST','/wc/home/speed',{speed:parseInt($('wc-home-speed').value)})"
+          style="padding:3px 7px;font-size:.65rem;border-color:#FF6B00;color:#FF6B00">Set</button>
+      </div>
+    </div>
+
+    <!-- Noise 설정 -->
+    <div style="display:flex;gap:6px;margin-bottom:8px;align-items:center">
+      <span style="font-size:.65rem;color:#555;white-space:nowrap">XY noise</span>
+      <input type="number" id="wc-nxy" value="10" min="0" max="50" style="max-width:48px;font-size:.72rem">
+      <span style="font-size:.65rem;color:#555">mm &nbsp; Z</span>
+      <input type="number" id="wc-nz" value="3" min="0" max="20" style="max-width:40px;font-size:.72rem">
+      <span style="font-size:.65rem;color:#555">mm</span>
+      <button onclick="wcSetNoise()" style="padding:3px 7px;font-size:.65rem;border-color:#FF6B00;color:#FF6B00">Set</button>
+    </div>
+
+    <!-- Waypoint 목록 -->
+    <div class="sub">Waypoints (순서대로 실행)</div>
+    <div id="wc-wp-list" style="margin-bottom:8px;display:flex;flex-direction:column;gap:3px">
+      <div style="font-size:.65rem;color:#333;padding:4px">없음 — 아래에서 추가</div>
+    </div>
+
+    <!-- Waypoint 추가 -->
+    <div style="background:#0d0d0d;border:1px solid #222;border-radius:5px;padding:7px;margin-bottom:8px">
+      <div class="sub" style="margin-bottom:4px">현재 위치를 Waypoint로 추가</div>
+      <div class="row" style="margin-bottom:4px">
+        <input id="wc-wp-name" type="text" placeholder="이름 (예: pick)" style="max-width:90px;font-size:.75rem">
+        <select id="wc-wp-gripper" style="background:#0d0d0d;color:#dde;border:1px solid #333;border-radius:4px;padding:4px;font-size:.72rem">
+          <option value="">그리퍼 없음</option>
+          <option value="grip">Grip (닫기)</option>
+          <option value="release">Release (열기)</option>
+        </select>
+      </div>
+      <div class="row" style="margin-bottom:4px;align-items:center">
+        <label style="font-size:.65rem;color:#aaa;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="wc-wp-noise"> Noise 적용
+        </label>
+        <span style="font-size:.65rem;color:#555">속도</span>
+        <input type="number" id="wc-wp-speed" value="40" min="5" max="100" style="max-width:45px;font-size:.72rem">
+        <span style="font-size:.65rem;color:#555">mm/s</span>
+        <button class="btn-g" style="flex:1" onclick="wcCaptureWp()">+ 추가</button>
+      </div>
+    </div>
+
+    <!-- 수집 실행 -->
+    <div class="sep"></div>
+    <div id="wc-status-bar" class="sbar" style="margin-bottom:6px">대기</div>
+    <div class="row" style="margin-bottom:5px">
+      <button class="btn-g" style="flex:1;padding:7px" onclick="api('POST','/wc/collect/step').then(wcRefresh)">▶ Step</button>
+      <input id="wc-auto-n" type="number" value="10" min="1" style="max-width:48px">
+      <button class="btn-g" style="flex:1;padding:7px" onclick="wcAutoCollect()">▶ Auto(n)</button>
+      <button class="btn-y" onclick="api('POST','/wc/collect/stop')">■ Stop</button>
+    </div>
   </div>
 
 </div><!-- end left col -->
 
-<!-- ══════════════ CENTER COL ══════════════ -->
+<!-- ══════ CENTER COL ══════ -->
 <div class="col">
 
-  <!-- Camera controls -->
   <div class="card">
-    <h3>Exterior Cameras</h3>
-    <div class="row" style="margin-bottom:4px">
-      <span style="font-size:.72rem;color:#00c8e8;min-width:105px">Cam 1 — HIKRobot</span>
+    <h3>Cameras</h3>
+    <div class="row" style="margin-bottom:4px;align-items:center">
+      <span style="font-size:.71rem;color:#FF6B00;min-width:110px">HIKRobot (Wrist)</span>
       <button class="btn-g" onclick="api('POST','/camera/hik/start')">Start</button>
       <button onclick="api('POST','/camera/hik/stop')">Stop</button>
-      <span id="hik-stat" style="font-size:.72rem;color:#668;margin-left:6px">OFF</span>
+      <span id="hik-stat" style="font-size:.7rem;color:#444;margin-left:6px">● OFF</span>
     </div>
-    <div class="row" style="margin-bottom:0">
-      <span style="font-size:.72rem;color:#00c8e8;min-width:105px">Cam 2 — ZED</span>
+    <div class="row" style="margin-bottom:0;align-items:center">
+      <span style="font-size:.71rem;color:#FF6B00;min-width:110px">ZED (Scene)</span>
       <button class="btn-g" onclick="api('POST','/camera/zed/start')">Start</button>
       <button onclick="api('POST','/camera/zed/stop')">Stop</button>
-      <span id="zed-stat" style="font-size:.72rem;color:#668;margin-left:6px">OFF</span>
+      <span id="zed-stat" style="font-size:.7rem;color:#444;margin-left:6px">● OFF</span>
     </div>
   </div>
 
-  <!-- Camera streams -->
   <div class="card" style="padding:8px">
     <div class="cam-row">
       <div class="cam-box">
-        <div class="cam-label">Cam 1 — HIKRobot</div>
+        <div class="cam-label">CAM 1 — HIKRobot Wrist</div>
         <img class="stream" src="/camera/hik/stream" alt="HIK">
       </div>
       <div class="cam-box">
-        <div class="cam-label">Cam 2 — ZED (LEFT)</div>
+        <div class="cam-label">CAM 2 — ZED Scene (LEFT)</div>
         <img class="stream" src="/camera/zed/stream" alt="ZED">
       </div>
     </div>
   </div>
 
-  <!-- Log -->
   <div class="card">
     <h3>Log</h3>
     <div id="log"></div>
@@ -1552,62 +1840,87 @@ input[type=range]{width:100%;accent-color:#00c8e8}
 
 </div><!-- end center col -->
 
-<!-- ══════════════ RIGHT COL: JOG ══════════════ -->
+<!-- ══════ RIGHT COL ══════ -->
 <div class="col">
   <div class="card">
     <h3>Jog Control</h3>
 
-    <!-- Gripper -->
-    <div class="row" style="margin-bottom:7px">
-      <button class="btn-g" style="flex:1;padding:7px" onclick="api('POST','/gripper/grip')">Grip ON [Q]</button>
-      <button style="flex:1;padding:7px" onclick="api('POST','/gripper/release')">Grip OFF [W]</button>
+    <!-- Gripper G2 -->
+    <div style="background:#0d0d0d;border:1px solid #222;border-radius:6px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:.7rem;color:#aaa;font-weight:600">Gripper G2</span>
+        <span style="font-size:.8rem;font-weight:700;color:#FF6B00;font-family:monospace">
+          <span id="grip-pos">—</span> mm
+        </span>
+      </div>
+      <div style="height:6px;background:#1a1a1a;border-radius:3px;margin-bottom:8px;overflow:hidden">
+        <div id="grip-bar" style="height:100%;background:#FF6B00;border-radius:3px;width:0%;transition:width .3s"></div>
+      </div>
+      <div class="grip-row" style="margin-bottom:6px">
+        <button class="grip-btn grip-on" onclick="api('POST','/gripper/grip')">
+          ◉ CLOSE ALL<br><small style="font-size:.6rem;font-weight:400">[Q] 완전닫기</small>
+        </button>
+        <button class="grip-btn grip-off" onclick="api('POST','/gripper/release')">
+          ○ OPEN ALL<br><small style="font-size:.6rem;font-weight:400">[W] 완전열기</small>
+        </button>
+      </div>
+      <div style="display:flex;gap:5px;align-items:center;margin-bottom:5px">
+        <input type="range" id="grip-slider" min="0" max="85" value="85"
+               style="flex:1;accent-color:#FF6B00"
+               oninput="$('grip-mm').textContent=this.value">
+        <span id="grip-mm" style="font-size:.72rem;color:#FF6B00;min-width:28px;font-family:monospace">85</span>
+        <button onclick="api('POST','/gripper/set',{pos:parseInt($('grip-slider').value)})"
+          style="padding:4px 8px;font-size:.72rem;border-color:#FF6B00;color:#FF6B00">Set</button>
+      </div>
+      <div style="font-size:.62rem;color:#444;line-height:1.6">
+        <b style="color:#666">[V]</b> 꾹=천천히 닫기 &nbsp;
+        <b style="color:#666">[C]</b> 꾹=천천히 열기
+      </div>
     </div>
 
     <!-- Speed -->
-    <div style="margin-bottom:8px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
-        <span style="font-size:.73rem;color:#aac8e0;font-weight:600">Jog Speed</span>
-        <span style="font-size:.82rem;font-weight:700;color:#00c8e8"><span id="speed-val">5</span>%</span>
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <span style="font-size:.71rem;color:#aaa;font-weight:600">Jog Speed</span>
+        <span style="font-size:.85rem;font-weight:700;color:#FF6B00"><span id="speed-val">15</span>%</span>
       </div>
-      <input type="range" id="jog-speed" min="1" max="50" value="5"
+      <input type="range" id="jog-speed" min="1" max="50" value="15"
              oninput="$('speed-val').textContent=this.value">
     </div>
 
     <!-- Capture pose -->
-    <div style="margin-bottom:8px">
-      <button onclick="capturePose()" style="width:100%;padding:6px;font-size:.75rem;background:#263445;border-color:#3a5a7a;color:#9cf">
+    <div style="margin-bottom:10px">
+      <button onclick="capturePose()"
+        style="width:100%;padding:6px;font-size:.74rem;background:#1a0e00;border-color:#FF6B00;color:#FF6B00">
         📍 현재 좌표 캡처
       </button>
-      <div id="pose-display"></div>
+      <div id="pose-display" style="margin-top:4px">—</div>
     </div>
 
     <div class="sep"></div>
 
     <!-- TCP XY D-pad + Z -->
     <div class="sub">TCP XY / Z &nbsp;·&nbsp; 키보드: ←→↑↓ / Z=Z+ X=Z-</div>
-    <div style="display:flex;align-items:center;margin-bottom:8px">
-      <!-- D-pad 3×3 -->
+    <div style="display:flex;align-items:center;margin-bottom:10px">
       <div class="dpad">
         <div></div>
-        <button class="jb btn-g" id="jb-Y+" data-axis="Y+">↑<br><small style="font-size:.55rem">Y+</small></button>
+        <button class="jb btn-g" id="jb-X+" data-axis="X+">↑<br><small style="font-size:.5rem">X+</small></button>
         <div></div>
-        <button class="jb btn-g" id="jb-X+" data-axis="X+">←<br><small style="font-size:.55rem">X+</small></button>
+        <button class="jb btn-g" id="jb-Y+" data-axis="Y+">←<br><small style="font-size:.5rem">Y+</small></button>
         <div class="jb center">XY</div>
-        <button class="jb btn-g" id="jb-X-" data-axis="X-">→<br><small style="font-size:.55rem">X-</small></button>
+        <button class="jb btn-g" id="jb-Y-" data-axis="Y-">→<br><small style="font-size:.5rem">Y-</small></button>
         <div></div>
-        <button class="jb btn-g" id="jb-Y-" data-axis="Y-">↓<br><small style="font-size:.55rem">Y-</small></button>
+        <button class="jb btn-g" id="jb-X-" data-axis="X-">↓<br><small style="font-size:.5rem">X-</small></button>
         <div></div>
       </div>
-      <!-- Z col -->
       <div class="zcol">
-        <button class="jb btn-g" id="jb-Z+" data-axis="Z+">Z+<br><small style="font-size:.55rem">▲</small></button>
-        <button class="jb btn-g" id="jb-Z-" data-axis="Z-">Z-<br><small style="font-size:.55rem">▼</small></button>
+        <button class="jb btn-g" id="jb-Z+" data-axis="Z+">Z+<br><small style="font-size:.5rem">▲</small></button>
+        <button class="jb btn-g" id="jb-Z-" data-axis="Z-">Z-<br><small style="font-size:.5rem">▼</small></button>
       </div>
     </div>
 
-    <!-- Rotation -->
-    <div class="sub">Rotation (Rx / Ry / Rz)</div>
-    <div class="rot-row" style="margin-bottom:8px">
+    <div class="sub">Rotation</div>
+    <div class="rot-row" style="margin-bottom:10px">
       <button class="jb" id="jb-Rx+" data-axis="Rx+">Rx+</button>
       <button class="jb" id="jb-Rx-" data-axis="Rx-">Rx-</button>
       <button class="jb" id="jb-Ry+" data-axis="Ry+">Ry+</button>
@@ -1618,7 +1931,6 @@ input[type=range]{width:100%;accent-color:#00c8e8}
 
     <div class="sep"></div>
 
-    <!-- Joint jog -->
     <div class="sub">Joint Jog</div>
     <div class="joint-table">
       <button class="jb" id="jb-J1+" data-axis="J1+">J1+</button>
@@ -1634,7 +1946,6 @@ input[type=range]{width:100%;accent-color:#00c8e8}
       <button class="jb" id="jb-J6+" data-axis="J6+">J6+</button>
       <button class="jb" id="jb-J6-" data-axis="J6-">J6-</button>
     </div>
-
   </div>
 </div><!-- end right col -->
 
@@ -1666,37 +1977,91 @@ setInterval(() => { if(ws.readyState===1) ws.send('ping'); }, 10000);
 setInterval(async () => {
   const s = await api('GET','/status');
   if(!s) return;
+
+  // Top header status badge
+  const dot = $('badge-dot');
+  const txt = $('badge-text');
+  if (!s.connected) {
+    dot.className = 'badge-dot off';
+    txt.textContent = 'OFFLINE';
+  } else if (s.robot_mode === 9) {
+    dot.className = 'badge-dot error';
+    txt.textContent = 'ERROR';
+  } else if (s.robot_mode === 7) {
+    dot.className = 'badge-dot running';
+    txt.textContent = 'RUNNING';
+  } else {
+    dot.className = 'badge-dot standby';
+    txt.textContent = s.robot_mode_str || 'STANDBY';
+  }
+
+  // REC indicator in header
+  const recEl = $('rec-indicator');
+  if (recEl) recEl.style.display = s.recording ? 'flex' : 'none';
+
+  // conn-bar
   $('conn-bar').innerHTML = `<span class="dot ${s.connected?'on':'off'}"></span>`
     + (s.connected ? 'Connected' : 'Disconnected')
-    + (s.recording ? ' &nbsp;<span class="dot rec"></span><b> REC</b>' : '');
+    + (s.recording ? ' &nbsp;<span class="dot rec"></span><b style="color:#EF4444"> REC</b>' : '');
 
-  // 로봇 MODE 표시 — ERROR(9)면 빨간 경고
+  // mode bar
   const isError = s.robot_mode === 9;
-  $('mode-bar').textContent = (isError ? '⚠ ROBOT ERROR — ' : 'Mode: ')
-    + (s.robot_mode_str||'—')
-    + (s.recording ? ` | REC ${s.frames??''}f` : '');
-  $('mode-bar').style.background = isError ? '#3a0a0a' : '#0d1a2e';
-  $('mode-bar').style.color      = isError ? '#ff4444' : '#dde';
-  $('mode-bar').style.fontWeight = isError ? '700' : 'normal';
+  $('mode-bar').textContent = (isError ? '⚠ ERROR — ' : 'State: ') + (s.robot_mode_str||'—')
+    + (s.recording ? ` · REC ${s.frames??''}f` : '');
+  $('mode-bar').style.color = isError ? '#EF4444' : '#aaa';
 
-  // ERROR 상태면 자동 수집 서버 측 중단 알림 (2회 연속 감지 시에만 — 순간적 error 무시)
+  // Auto-stop on repeated error
   if (!window._errCount) window._errCount = 0;
   if (isError) { window._errCount++; } else { window._errCount = 0; }
   if (window._errCount >= 2 && s.auto_target > 0) {
     window._errCount = 0;
-    addLog('⚠ [ERROR] 로봇 충돌/알람 감지 — 자동 수집 중단됨. Clear Alarm 후 재시작하세요.');
+    addLog('⚠ 로봇 에러 감지 — 자동 수집 중단. Clear Error 후 재시작하세요.');
     api('POST','/pick-place/stop');
   }
-  if(s.joints) ['J1','J2','J3','J4','J5','J6'].forEach((k,i)=>{
-    const el=$('d'+k); if(el) el.textContent=s.joints[i]?.toFixed(1)??'—';
-  });
+
+  // Joint values — header + card
+  if(s.joints) {
+    ['J1','J2','J3','J4','J5','J6'].forEach((k,i)=>{
+      const v = s.joints[i]?.toFixed(1) ?? '—';
+      const el=$('d'+k); if(el) el.textContent=v;
+      const hEl=$('h'+k); if(hEl) hEl.textContent=v+'°';
+    });
+  }
+  // Gripper position
+  const gp = s.gripper_pos;
+  const gpEl = $('grip-pos');
+  const gpBar = $('grip-bar');
+  if (gpEl) gpEl.textContent = gp !== null && gp !== undefined ? gp.toFixed(1) : '—';
+  if (gpBar && gp !== null && gp !== undefined) gpBar.style.width = Math.min(100, (gp/85)*100).toFixed(1)+'%';
+  // Manual rec bar
+  const recBarEl = $('rec-bar');
+  const recStartBtn = $('rec-start-btn');
+  const recSaveBtn  = $('rec-save-btn');
+  const recDiscBtn  = $('rec-disc-btn');
+  if (recBarEl) {
+    if (s.recording) {
+      recBarEl.innerHTML = '<span class="dot rec"></span> <b style="color:#EF4444">REC</b> ' + (s.frames||0) + ' frames';
+      recBarEl.style.color = '#EF4444';
+      if(recStartBtn) { recStartBtn.disabled=true; recStartBtn.style.opacity='0.4'; }
+      if(recSaveBtn)  { recSaveBtn.disabled=false; recSaveBtn.style.opacity='1'; }
+      if(recDiscBtn)  { recDiscBtn.disabled=false; recDiscBtn.style.opacity='1'; recDiscBtn.style.color='#aaa'; recDiscBtn.style.borderColor='#aaa'; }
+    } else {
+      recBarEl.textContent = '대기 중';
+      recBarEl.style.color = '#aaa';
+      if(recStartBtn) { recStartBtn.disabled=false; recStartBtn.style.opacity='1'; }
+      if(recSaveBtn)  { recSaveBtn.disabled=true;  recSaveBtn.style.opacity='0.4'; }
+      if(recDiscBtn)  { recDiscBtn.disabled=true;  recDiscBtn.style.opacity='0.4'; recDiscBtn.style.color='#666'; recDiscBtn.style.borderColor='#555'; }
+    }
+  }
   if(s.pose) ['X','Y','Z','RX','RY','RZ'].forEach((k,i)=>{
     const el=$('d'+k); if(el) el.textContent=s.pose[i]?.toFixed(1)??'—';
   });
-  $('hik-stat').textContent = s.cam_hik ? 'ON ●' : 'OFF';
-  $('hik-stat').style.color  = s.cam_hik ? '#2dc653' : '#668';
-  $('zed-stat').textContent  = s.cam_zed ? 'ON ●' : 'OFF';
-  $('zed-stat').style.color  = s.cam_zed ? '#2dc653' : '#668';
+
+  $('hik-stat').textContent = s.cam_hik ? '● ON' : '● OFF';
+  $('hik-stat').style.color  = s.cam_hik ? '#22C55E' : '#444';
+  $('zed-stat').textContent  = s.cam_zed ? '● ON' : '● OFF';
+  $('zed-stat').style.color  = s.cam_zed ? '#22C55E' : '#444';
+
   if(s.auto_target > 0)
     $('auto-bar').textContent = `Auto: ${s.auto_done}/${s.auto_target}`;
   else if(s.worker_running)
@@ -1704,42 +2069,26 @@ setInterval(async () => {
   else
     $('auto-bar').textContent = 'Ready';
 
-  // 수집 모드 표시
-  const m = s.collect_mode || 'auto';
-  const mLabel = m === 'v10' ? '② v10 고정홈 (j3=42°, j4=-1.4°)' : '① 기존 랜덤포즈';
-  const mEl = $('mode-display');
-  if (mEl) {
-    mEl.textContent = '모드: ' + mLabel;
-    mEl.style.color = m === 'v10' ? '#a78bfa' : '#2dc653';
-  }
-  const bAuto = $('mode-btn-auto'), bV10 = $('mode-btn-v10');
-  if (bAuto && bV10) {
-    bAuto.style.fontWeight = m === 'auto' ? '700' : 'normal';
-    bV10.style.fontWeight  = m === 'v10'  ? '700' : 'normal';
-    bV10.style.background  = m === 'v10'  ? '#2d1f5e' : '';
-  }
+
 }, 800);
 
-// ── Jog logic ──────────────────────────────
+// Jog
 const getSpeed = () => parseInt($('jog-speed').value) || 5;
-let _jogAxis = null;  // currently held axis (prevents duplicate stop calls)
-
+let _jogAxis = null;
 const jogStart = axis => {
-  if (_jogAxis === axis) return;  // already jogging this axis
+  if (_jogAxis === axis) return;
   _jogAxis = axis;
   const el = document.getElementById('jb-' + axis);
   if (el) el.classList.add('jogging');
   api('POST','/jog/start',{axis, speed:getSpeed()});
 };
 const jogStop = () => {
-  if (!_jogAxis) return;  // nothing to stop
+  if (!_jogAxis) return;
   const el = document.getElementById('jb-' + _jogAxis);
   if (el) el.classList.remove('jogging');
   _jogAxis = null;
   api('POST','/jog/stop');
 };
-
-// Attach events to all .jb buttons with data-axis
 document.querySelectorAll('.jb[data-axis]').forEach(btn => {
   const ax = btn.dataset.axis;
   btn.addEventListener('mousedown',  e => { e.preventDefault(); jogStart(ax); });
@@ -1748,25 +2097,38 @@ document.querySelectorAll('.jb[data-axis]').forEach(btn => {
   btn.addEventListener('touchend',   () => jogStop());
   btn.addEventListener('mouseleave', () => { if(_jogAxis===ax) jogStop(); });
 });
-
-// Keyboard jog
 const KEY_MAP = {
-  'ArrowLeft':'X+', 'ArrowRight':'X-',
-  'ArrowUp':'Y+',   'ArrowDown':'Y-',
-  'z':'Z+', 'Z':'Z+',
-  'x':'Z-', 'X':'Z-',
+  'ArrowLeft':'Y+',  'ArrowRight':'Y-',
+  'ArrowUp':'X+',    'ArrowDown':'X-',
+  'z':'Z+', 'Z':'Z+', 'x':'Z-', 'X':'Z-',
 };
+let _gripJogging = false;
 document.addEventListener('keydown', e => {
   if (e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
-  if (e.repeat) return;
   const k = e.key;
-  if (k==='q'||k==='Q') { api('POST','/gripper/grip'); return; }
+  // V = close jog, C = open jog (keydown 첫 번만, 꾹 누르면 계속 이동 중)
+  if (k==='v'||k==='V') {
+    if (!e.repeat) { _gripJogging=true; api('POST','/gripper/jog',{direction:'close'}); }
+    e.preventDefault(); return;
+  }
+  if (k==='c'||k==='C') {
+    if (!e.repeat) { _gripJogging=true; api('POST','/gripper/jog',{direction:'open'}); }
+    e.preventDefault(); return;
+  }
+  if (e.repeat) return;
+  if (k==='q'||k==='Q') { api('POST','/gripper/grip');    return; }
   if (k==='w'||k==='W') { api('POST','/gripper/release'); return; }
   const ax = KEY_MAP[k];
   if (ax) { jogStart(ax); e.preventDefault(); }
 });
 document.addEventListener('keyup', e => {
-  const ax = KEY_MAP[e.key];
+  const k = e.key;
+  if ((k==='v'||k==='V'||k==='c'||k==='C') && _gripJogging) {
+    _gripJogging = false;
+    api('POST','/gripper/jog/stop');
+    e.preventDefault(); return;
+  }
+  const ax = KEY_MAP[k];
   if (ax && _jogAxis===ax) { jogStop(); e.preventDefault(); }
 });
 window.addEventListener('blur', () => jogStop());
@@ -1780,21 +2142,24 @@ const capturePose = async () => {
     $('pose-display').textContent = 'fetch failed';
 };
 
-// Misc handlers
 const autoCollect = () => api('POST','/pick-place/auto',{n:$('auto-n').value});
-const doEstop = () => { if(confirm('E-STOP?')) api('POST','/estop'); };
-const setCollectMode = async (mode) => {
-  const d = await api('POST', '/collect-mode', {mode});
-  if (d && d.ok) addLog(`✓ 모드 전환: ${mode}`);
+const recStart = async () => {
+  const d = await api('POST','/record/start');
+  if(d && d.ok) addLog('● REC started');
 };
+const recStop = async (success) => {
+  const d = await api('POST', '/record/stop', {success});
+  if(d && d.ok) addLog(success ? '■ ' + d.msg : '✕ Discarded');
+};
+const doEstop = () => { if(confirm('E-STOP?')) api('POST','/estop'); };
+
 const clearAlarm = async () => {
   const d = await api('POST','/clear-alarm');
-  if(d&&d.ok) addLog('✓ Alarm cleared');
+  if(d&&d.ok) addLog('✓ Error cleared');
 };
 
-// ── 앵커 페어 선택 ─────────────────────────────────────────────────────────
+// Anchor pair
 let _ancDir = 'auto', _ancA = -1, _ancB = -1;
-
 const _anchorApply = async () => {
   try {
     const params = new URLSearchParams({direction:_ancDir, a_idx:_ancA, b_idx:_ancB});
@@ -1802,69 +2167,136 @@ const _anchorApply = async () => {
   } catch(e) { addLog('✗ anchor: ' + e); }
   _anchorRefreshUI();
 };
-
 const anchorSetDir = dir  => { _ancDir = dir; _anchorApply(); };
 const anchorSetA   = idx  => { _ancA = idx;   _anchorApply(); };
 const anchorSetB   = idx  => { _ancB = idx;   _anchorApply(); };
-
 const _anchorRefreshUI = () => {
-  // Direction buttons
   ['A','B','auto'].forEach(v => {
     const el = $('dir-' + v);
     if (el) el.className = (v === _ancDir) ? 'anc-active' : '';
   });
-  // A anchor buttons
   ['rand',0,1,2].forEach((v,i) => {
-    const id = 'aa-' + v;
-    const el = $(id);
+    const el = $('aa-' + v);
     if (el) el.className = ((i===0 ? -1 : i-1) === _ancA) ? 'anc-active' : '';
   });
-  // B anchor buttons
   ['rand',0,1,2].forEach((v,i) => {
-    const id = 'ba-' + v;
-    const el = $(id);
+    const el = $('ba-' + v);
     if (el) el.className = ((i===0 ? -1 : i-1) === _ancB) ? 'anc-active' : '';
   });
-  // Display label
-  const aLbl = _ancA >= 0 ? (['A3','A4','A5'][_ancA] ?? '?') : '랜덤';
-  const bLbl = _ancB >= 0 ? (['B1','B2','B3'][_ancB] ?? '?') : '랜덤';
-  const dLbl = {A:'A→B', B:'B→A', auto:'Auto (교번)'}[_ancDir] ?? _ancDir;
+  const aLbl = _ancA >= 0 ? (['A3','A4','A5'][_ancA]??'?') : '랜덤';
+  const bLbl = _ancB >= 0 ? (['B1','B2','B3'][_ancB]??'?') : '랜덤';
+  const dLbl = {A:'A→B', B:'B→A', auto:'Auto(교번)'}[_ancDir] ?? _ancDir;
   const el = $('anchor-display');
   if (el) el.textContent = `${dLbl} | A=${aLbl} | B=${bLbl}`;
 };
 
-// 앵커 상태 + 진행 현황 폴링 (2초마다)
 setInterval(async () => {
   try {
     const r = await fetch('/anchor-status');
     const d = await r.json();
     const counts = d.pair_counts || {};
-    // A→B 테이블: 행=a_idx(0~2), 열=b_idx(0~2)
-    for (let a = 0; a < 3; a++) {
+    for (let a = 0; a < 3; a++)
       for (let b = 0; b < 3; b++) {
         const el = $(`pl-AB_${a}_${b}`);
-        if (el) {
-          const n = counts[`AB_${a}_${b}`] || 0;
-          el.textContent = n;
-          el.className = n > 0 ? 'pc has-data' : 'pc';
-        }
+        if (el) { const n=counts[`AB_${a}_${b}`]||0; el.textContent=n; el.className=n>0?'pc has-data':'pc'; }
       }
-    }
-    // B→A 테이블: 행=b_idx(0~2), 열=a_idx(0~2)
-    for (let b = 0; b < 3; b++) {
+    for (let b = 0; b < 3; b++)
       for (let a = 0; a < 3; a++) {
         const el = $(`pl-BA_${b}_${a}`);
-        if (el) {
-          const n = counts[`BA_${b}_${a}`] || 0;
-          el.textContent = n;
-          el.className = n > 0 ? 'pc has-data' : 'pc';
-        }
+        if (el) { const n=counts[`BA_${b}_${a}`]||0; el.textContent=n; el.className=n>0?'pc has-data':'pc'; }
       }
-    }
   } catch(e) {}
 }, 2000);
 
-_anchorRefreshUI();   // 초기 UI 상태 적용
+_anchorRefreshUI();
+
+// ── Waypoint Collector ─────────────────────────────────────────────────────
+const wcRefresh = async () => {
+  const d = await api('GET', '/wc/status');
+  if (!d || !d.ok) return;
+
+  // Home status
+  const hEl = $('wc-home-status');
+  if (hEl) {
+    if (d.home_set) {
+      const j = d.home_joints.map(v => v.toFixed(1)).join(', ');
+      hEl.textContent = '설정됨';
+      hEl.style.color = '#22C55E';
+    } else {
+      hEl.textContent = '미설정';
+      hEl.style.color = '#555';
+    }
+  }
+  const ghBtn = $('wc-goto-home-btn');
+  if (ghBtn) ghBtn.disabled = !d.home_set;
+
+  // Noise
+  const nxy = $('wc-nxy'); const nz = $('wc-nz');
+  if (nxy) nxy.value = d.noise_xy_mm;
+  if (nz)  nz.value  = d.noise_z_mm;
+
+  // Waypoints list
+  const listEl = $('wc-wp-list');
+  if (listEl) {
+    if (!d.waypoints || d.waypoints.length === 0) {
+      listEl.innerHTML = '<div style="font-size:.65rem;color:#333;padding:4px">없음 — 아래에서 추가</div>';
+    } else {
+      listEl.innerHTML = d.waypoints.map((wp, i) => {
+        const noiseTag  = wp.noise   ? '<span style="color:#FF6B00;font-size:.58rem">±noise</span>' : '';
+        const gripTag   = wp.gripper ? `<span style="color:#22C55E;font-size:.58rem">${wp.gripper}</span>` : '';
+        const pos = wp.values ? `(${wp.values[0].toFixed(0)}, ${wp.values[1].toFixed(0)}, ${wp.values[2].toFixed(0)})` : '';
+        return `<div style="background:#1a1a1a;border:1px solid #2a2a2a;border-radius:4px;padding:5px 7px;display:flex;align-items:center;gap:5px">
+          <span style="font-size:.62rem;color:#555;min-width:14px">${i+1}</span>
+          <span style="font-size:.72rem;color:#FF6B00;font-weight:600;min-width:70px">${wp.name}</span>
+          <span style="font-size:.62rem;color:#444;flex:1">${pos}</span>
+          ${noiseTag} ${gripTag}
+          <button onclick="api('POST','/wc/waypoint/goto',{name:'${wp.name}'})" style="padding:2px 6px;font-size:.62rem">→</button>
+          <button onclick="wcDeleteWp('${wp.name}')" style="padding:2px 6px;font-size:.62rem;border-color:#EF4444;color:#EF4444">✕</button>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  // Status bar
+  const sb = $('wc-status-bar');
+  if (sb) {
+    sb.textContent = d.running ? '실행 중…' : `대기  |  Waypoints: ${d.waypoints?.length || 0}`;
+    sb.style.color = d.running ? '#FF6B00' : '#aaa';
+  }
+};
+
+const wcCaptureHome = async () => {
+  const d = await api('POST', '/wc/home/capture');
+  if (d && d.ok) { addLog('✓ Home 캡처됨'); wcRefresh(); }
+};
+const wcCaptureWp = async () => {
+  const name    = $('wc-wp-name').value.trim();
+  const gripper = $('wc-wp-gripper').value;
+  const noise   = $('wc-wp-noise').checked;
+  const speed   = parseFloat($('wc-wp-speed').value) || 40;
+  if (!name) { addLog('✗ 이름 입력 필요'); return; }
+  const d = await api('POST', '/wc/waypoint/capture', {name, noise, gripper, speed});
+  if (d && d.ok) { addLog(`✓ Waypoint 추가: ${name}`); wcRefresh(); }
+};
+const wcDeleteWp = async (name) => {
+  const d = await api('POST', '/wc/waypoint/delete', {name});
+  if (d && d.ok) { addLog(`✓ 삭제: ${name}`); wcRefresh(); }
+};
+const wcSetNoise = async () => {
+  const xy = parseFloat($('wc-nxy').value) || 10;
+  const z  = parseFloat($('wc-nz').value)  || 3;
+  const d = await api('POST', '/wc/noise', {xy_mm: xy, z_mm: z});
+  if (d && d.ok) addLog(`✓ Noise: XY±${xy}mm Z±${z}mm`);
+};
+const wcAutoCollect = () => {
+  const n = parseInt($('wc-auto-n').value) || 10;
+  api('POST', '/wc/collect/auto', {n}).then(wcRefresh);
+  addLog(`▶ WC Auto ${n}회 시작`);
+};
+
+// WC 상태 2초마다 갱신
+setInterval(wcRefresh, 2000);
+wcRefresh();
 </script>
 </body>
 </html>"""
@@ -1879,6 +2311,6 @@ if __name__ == "__main__":
         s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
     except Exception:
         ip = "localhost"
-    print(f"\n  Dobot E6 Robot Server")
+    print(f"\n  UFactory xArm Robot Server")
     print(f"  Open: http://{ip}:8000\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

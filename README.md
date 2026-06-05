@@ -1,232 +1,155 @@
-# Dobot-Arm-DataCollect
+# dobot-xarm-datacollect
 
-Dobot E6 로봇 + 듀얼 카메라(HIK + ZED)를 이용한 VLA(Vision-Language-Action) 데이터 수집 시스템.
-FastAPI 기반 웹 서버와 ROS2 Humble 동기화 레코더를 통해 로봇 상태와 카메라 프레임을 정밀하게 정합(align)하여 저장한다.
+Dobot E6 및 UFactory xArm6 두 가지 로봇 암을 지원하는 **VLA(Vision-Language-Action) 학습용 데이터 수집 시스템**.  
+FastAPI 웹 서버 + ROS2 Humble 동기화 레코더로 로봇 상태와 카메라 프레임을 정밀 정합하여 저장합니다.
+
+---
+
+## 지원 로봇
+
+| 로봇 | 디렉토리 | 통신 | 상태 |
+|------|----------|------|------|
+| **Dobot E6** | `Dobot_E6_Moveit2/` | TCP/IP `192.168.5.1` | ✅ 안정 운용 중 |
+| **UFactory xArm6** | `UFactory/` | TCP/IP `192.168.1.225` | ✅ 운용 중 |
+
+---
+
+## 디렉토리 구조
+
+```
+dobot-xarm-datacollect/
+├── Dobot_E6_Moveit2/          # Dobot E6 전용
+│   ├── src/
+│   │   ├── robot_server.py        # FastAPI 서버 (port 8000)
+│   │   ├── dobot_e6_controller.py # TCP/IP 제어
+│   │   ├── pick_place_gui_new.py  # Pick-Place GUI + 레코더
+│   │   ├── pick_place_gui_random_pose.py
+│   │   ├── suction_gripper.py     # 흡착 그리퍼
+│   │   ├── camera_viewer.py       # HIKRobot 카메라
+│   │   └── ros2_recorder.py       # ROS2 동기화 레코더
+│   ├── urdf/                  # Dobot ME6 URDF
+│   └── config/                # MoveIt2 설정
+│
+├── UFactory/                  # UFactory xArm6 전용
+│   └── src/
+│       ├── robot_server.py        # FastAPI 서버 (port 8000)
+│       ├── xarm_controller.py     # xArm SDK 제어 + 안전설정
+│       ├── xarm_gripper.py        # xArm Gripper G2
+│       ├── waypoint_collector.py  # Waypoint 기반 자동 수집
+│       ├── pick_place_gui_new.py  # Pick-Place GUI
+│       ├── camera_viewer.py       # HIKRobot 카메라
+│       └── ros2_recorder.py       # ROS2 동기화 레코더
+│
+├── MvImport/                  # HIKRobot SDK (공용)
+├── dobot_api.py               # Dobot raw TCP/IP API
+├── camera_calibration_hikrobot.py
+├── hikrobot_calibration_*.npz # HIK 카메라 캘리브레이션
+└── check_camera.py
+```
 
 ---
 
 ## 시스템 구성
 
 | 구성 요소 | 사양 |
-|---|---|
-| 로봇 | Dobot E6 (TCP/IP 192.168.5.1) |
-| 손목 카메라 | HIKRobot (USB) |
-| 씬 카메라 | ZED 2i (USB3, LEFT view) |
+|-----------|------|
 | 컴퓨터 | NVIDIA Jetson (Ubuntu 22.04 aarch64) |
-| 서버 | FastAPI (port 8000) |
+| 손목 카메라 | HIKRobot (USB) |
+| 씬 카메라 | ZED 2i (USB3, LEFT view 224×224) |
+| 서버 포트 | FastAPI port 8000 |
 | 동기화 | ROS2 Humble — ApproximateTimeSynchronizer |
 
 ---
 
-## 데이터 수집 파이프라인
+## 데이터 수집 플로우
 
 ```mermaid
 flowchart TD
-    subgraph HW["Hardware"]
-        HIK["HIK Robot Camera\n손목 카메라 · USB"]
-        ZED["ZED 2i\n씬 카메라 · USB3"]
-        DOBOT["Dobot E6\nTCP/IP · 192.168.5.1"]
-    end
+    A[로봇 선택] --> B{로봇 타입}
+    B -->|Dobot E6| C[Dobot_E6_Moveit2/src]
+    B -->|xArm6| D[UFactory/src]
 
-    subgraph SERVER["robot_server.py  ·  FastAPI :8000"]
-        direction TB
-        HIK_LOOP["_hik_grab_loop\n(daemon thread)"]
-        ZED_LOOP["_zed_grab_loop\n(daemon thread)"]
-        ROBOT_PUB["_robot_pub_loop\n~50 Hz"]
-        MJPEG["MJPEG 스트림\n브라우저 실시간 뷰"]
-        API["REST API + WebSocket\n/connect /status\n/pick-place/auto\n/camera/* /ws/logs"]
-    end
+    C --> E[python3 robot_server.py]
+    D --> E
 
-    subgraph ROS2["ros2_recorder.py  ·  ROS2 Humble Node"]
-        direction TB
-        P_HIK["/dobot/hik/image_raw"]
-        P_ZED["/dobot/zed/image_raw"]
-        P_JS["/dobot/joint_states"]
-        SYNC["ApproximateTimeSynchronizer\nslop = 35 ms"]
-        CACHE["Robot State Cache\njoints / tcp / gripper"]
-        SAVE_W["Save Worker\n(async queue)"]
-    end
+    E --> F[http://Jetson-IP:8000]
 
-    subgraph DISK["External Drive  ·  /media/.../2CAM/"]
-        EP["Episode N/\n├─ images/hik/frame_XXXXXX.jpg  224×224\n├─ images/zed/frame_XXXXXX.jpg  224×224\n├─ robot_data.csv\n├─ dataset.npy\n└─ metadata.txt"]
-    end
+    F --> G[Connect 로봇]
+    G --> H[카메라 Start]
+    H --> I{수집 방식}
 
-    HIK --> HIK_LOOP
-    ZED --> ZED_LOOP
-    DOBOT --> ROBOT_PUB
+    I -->|수동 레코딩| J[조그로 움직이며\n● REC Start / ■ Save]
+    I -->|Waypoint 자동| K[Waypoint 설정\n▶ Auto N회]
+    I -->|Pick-Place 자동\nDobot 전용| L[앵커 페어 설정\n▶ Auto N회]
 
-    HIK_LOOP -->|"BGR"| MJPEG
-    HIK_LOOP -->|"publish + stamp"| P_HIK
-    ZED_LOOP -->|"BGR"| MJPEG
-    ZED_LOOP -->|"publish + stamp"| P_ZED
-    ROBOT_PUB -->|"publish"| P_JS
-    ROBOT_PUB -->|"update"| CACHE
+    J --> M[episode_N/\nimages/hik + zed\ndataset.npy\nepisode_meta.json]
+    K --> M
+    L --> M
 
-    P_HIK --> SYNC
-    P_ZED --> SYNC
-    SYNC -->|"35ms 이내 쌍 보장"| SAVE_W
-    CACHE -->|"sync 시각 기준"| SAVE_W
-    SAVE_W --> EP
-
-    API -->|"start/stop recording"| ROS2
-    API -->|"MJPEG"| MJPEG
+    M --> N[π0.5 / openpi\n학습 포맷 변환]
 ```
-
-### 동기화 원리
-
-```mermaid
-sequenceDiagram
-    participant H as HIK grab thread
-    participant Z as ZED grab thread
-    participant S as ApproximateTime<br/>Synchronizer
-    participant C as Robot State Cache
-    participant R as _robot_pub_loop (50Hz)
-    participant D as Disk
-
-    H->>S: Image + stamp_hik (캡처 직후)
-    Z->>S: Image + stamp_zed (캡처 직후)
-    R->>C: joints/tcp/gripper @ 50Hz
-
-    Note over S: |stamp_hik − stamp_zed| ≤ 35ms 일 때만 콜백 발동
-
-    S->>D: hik_frame + zed_frame + robot_state(cache 기준)
-    Note over D: 두 카메라 프레임이 동일 시각 기준으로 정합되어 저장
-```
-
-### 모드별 동작
-
-| 조건 | 레코딩 경로 | 동기화 품질 |
-|---|---|---|
-| ROS2 + HIK + ZED | `ros2_recorder` sync callback | HIK ↔ ZED 35ms 이내 보장 |
-| ROS2 + HIK only | legacy `_record_tick` fallback | 버퍼 지연 최대 50ms |
-| ROS2 미설치 | legacy `_record_tick` fallback | 버퍼 지연 최대 50ms |
 
 ---
 
-## 설치
+## 빠른 시작
 
-### 1. 의존 패키지
-
-```bash
-pip install fastapi uvicorn numpy opencv-python
-```
-
-### 2. ROS2 Humble (Ubuntu 22.04 aarch64)
+### Dobot E6
 
 ```bash
-sudo apt install -y software-properties-common curl
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-     -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-     http://packages.ros.org/ros2/ubuntu jammy main" \
-     | sudo tee /etc/apt/sources.list.d/ros2.list
-sudo apt update
-sudo apt install -y ros-humble-ros-base ros-humble-cv-bridge \
-                    python3-rclpy python3-sensor-msgs
-
-echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
-source ~/.bashrc
+cd ~/dobot-xarm-datacollect/Dobot_E6_Moveit2/src
+python3 robot_server.py
+# → http://<Jetson-IP>:8000
 ```
 
-### 3. 카메라 SDK
+### UFactory xArm6
 
-- **HIKRobot**: MVS SDK 설치 후 `MvImport/` 경로 확인
-- **ZED**: [ZED SDK](https://www.stereolabs.com/developers/) + `pyzed` 설치
+```bash
+# 네트워크 설정 (최초 1회)
+sudo nmcli connection modify robot_net +ipv4.addresses 192.168.1.100/24
+sudo nmcli connection up robot_net
+
+cd ~/dobot-xarm-datacollect/UFactory/src
+python3 robot_server.py
+# → http://<Jetson-IP>:8000
+```
 
 ---
 
-## 실행
-
-```bash
-cd Dobot_E6_Moveit2/src
-source /opt/ros/humble/setup.bash
-python robot_server.py
-```
-
-브라우저에서 `http://<Jetson-IP>:8000` 접속.
-
-### 서버 시작 로그 (정상)
-
-```
-[ros2_recorder] ROS2 노드 시작 완료
-[HH:MM:SS] ROS2 recorder ready (sync mode)
-[HH:MM:SS] Server ready
-```
-
-### 데이터 수집 순서
-
-1. **Connect** — 로봇 TCP/IP 연결
-2. **Enable** — 로봇 활성화
-3. **Camera Start** — HIK / ZED 카메라 시작
-4. **Auto Collect N** — N개 에피소드 자동 수집
-5. 수집 완료 로그 확인:
-   ```
-   Recording started → .../1 (ZED=ON, mode=ROS2+sync)
-   [ros2_recorder] stopped — 680 synced frames
-   Saved 680 frames → .../1
-   ```
-
----
-
-## 저장 데이터 형식
-
-에피소드 하나당 아래 구조로 저장된다.
-
-```
-Episode N/
-├── images/
-│   ├── hik/  frame_000000.jpg ~ frame_XXXXXX.jpg   # 224×224 (손목 카메라)
-│   └── zed/  frame_000000.jpg ~ frame_XXXXXX.jpg   # 224×224 (씬 카메라)
-├── robot_data.csv    # 프레임별 타임스탬프 + 관절각 + TCP 포즈 + 그리퍼 상태
-├── dataset.npy       # robot_data.csv 와 동일 내용 (numpy array of dicts)
-└── metadata.txt      # 에피소드 요약 (날짜, 프레임 수, 카메라 구성, 성공 여부)
-```
-
-### robot_data.csv 컬럼
-
-| 컬럼 | 설명 |
-|---|---|
-| `frame_id` | 프레임 번호 (0-indexed) |
-| `timestamp` | HIK 캡처 시각 (ROS clock, float) |
-| `image_path_hik` | `hik/frame_XXXXXX.jpg` |
-| `image_path_zed` | `zed/frame_XXXXXX.jpg` |
-| `j1` ~ `j6` | 관절각 (deg) |
-| `x y z rx ry rz` | TCP 포즈 (mm / deg) |
-| `gripper_tooldo1` | 그리퍼 상태 (0/1) |
-| `robot_mode` | 로봇 모드 코드 |
-
-### 수집 후 품질 확인
+## 저장 데이터 포맷
 
 ```python
-import numpy as np
-
-data = np.load("dataset.npy", allow_pickle=True)
-timestamps = [d['timestamp'] for d in data]
-diffs = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-print(f"평균 간격: {sum(diffs)/len(diffs)*1000:.1f} ms")  # 목표: ~50 ms (20 Hz)
-print(f"최대 간격: {max(diffs)*1000:.1f} ms")              # 이상치 확인
+# dataset.npy 한 프레임
+{
+    'frame_id':        int,
+    'timestamp':       float,
+    'image_path_hik':  'hik/frame_000000.jpg',   # 224×224
+    'image_path_zed':  'zed/frame_000000.jpg',   # 224×224
+    'joint_angles':    [j1, j2, j3, j4, j5, j6], # degrees
+    'tcp_pose':        [x, y, z, rx, ry, rz],    # mm / deg
+    'gripper_tooldo1': 0 or 1,
+    'robot_mode':      int,
+}
 ```
 
 ---
 
-## 브랜치 구조
+## 의존성
 
-| 브랜치 | 설명 |
-|---|---|
-| `main` | 기본 TCP/IP 제어 스크립트 |
-| `ros2` | FastAPI 서버 + ROS2 동기화 레코더 통합 버전 |
+```bash
+pip install xarm-python-sdk fastapi uvicorn opencv-python numpy
+# ROS2 Humble (Ubuntu 22.04)
+sudo apt install ros-humble-ros-base ros-humble-cv-bridge python3-rclpy
+```
 
 ---
 
-## 주요 파일
+## 안전 설정 (xArm6)
+
+연결 시 자동 적용:
 
 ```
-Dobot_E6_Moveit2/src/
-├── robot_server.py          # FastAPI 메인 서버 (카메라·로봇·레코딩 통합)
-├── ros2_recorder.py         # ROS2 동기화 레코더 모듈
-├── dobot_e6_controller.py   # Dobot E6 TCP/IP 제어
-├── pick_place_gui_random_pose.py  # 랜덤 포즈 Pick-Place 워커
-├── camera_viewer.py         # HIKRobot 카메라 래퍼
-├── suction_gripper.py       # 흡착 그리퍼 제어
-└── ROS2_FLOWCHART.md        # 상세 시스템 플로우차트
+TCP Boundary : X 100~750mm / Y -550~550mm / Z -100~650mm
+Joint Limits : J2[-118~120°] J3[-225~11°] J5[-97~180°]
+Max TCP Speed: 300 mm/s
+Collision Rebound: ON
 ```

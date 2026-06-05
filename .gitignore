@@ -1,26 +1,29 @@
-﻿# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Legacy archive (보관용, git 미포함)
-legacy_archive/
+# Colcon build artifacts
+Dobot_E6_Moveit2/src/build/
+Dobot_E6_Moveit2/src/install/
+Dobot_E6_Moveit2/src/log/
 
-# Data output folders (수집 데이터, 내용 git 미포함)
-vla_dataset/*
-!vla_dataset/.gitkeep
-vla_dataset_define/*
-!vla_dataset_define/.gitkeep
-vla_dataset_random_pose/*
-!vla_dataset_random_pose/.gitkeep
+# Data (not tracked in git)
+vla_dataset/
+vla_dataset_random_pose/
+vla_dataset_define/
+logs/
+picture/
 
-# Logs (내용 git 미포함, 폴더만 유지)
-logs/*
-!logs/.gitkeep
-
-# Calibration outputs
+# Calibration data (large binary)
 *.npz
 
-# OS
-.DS_Store
-Thumbs.db
+# Waypoints (local machine specific)
+UFactory/src/waypoints.json
+
+# IDE / Claude
+.vscode/
+.idea/
+**/.claude/
+*.swp
